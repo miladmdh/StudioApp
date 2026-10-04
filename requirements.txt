@@ -1,0 +1,5 @@
+PyQt6
+jdatetime
+openpyxl
+matplotlib
+pyinstaller
