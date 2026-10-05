@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QComboBox, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QGroupBox, QSpinBox, QFormLayout, QFileDialog,
-    QTabWidget, QCheckBox, QDialog, QDialogButtonBox, QTextEdit
+    QTabWidget, QCheckBox, QDialog
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QIcon
@@ -18,7 +18,6 @@ import matplotlib.pyplot as plt
 
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-from reportlab.lib import colors
 
 DB_NAME = "studio_accounting.db"
 
@@ -132,17 +131,26 @@ class LoginDialog(QDialog):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("ورود به نرم‌افزار ایمارت استودیو")
-        self.resize(320, 160)
+        self.resize(340, 180)
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         
+        icon_path = resource_path("Accounting.png")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
+            
         layout = QVBoxLayout()
-        layout.addWidget(QLabel("رمز عبور را وارد کنید (پیش‌فرض: 123):"))
+        lbl = QLabel("رمز عبور را وارد کنید:")
+        lbl.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
+        layout.addWidget(lbl)
+        
         self.txt_pass = QLineEdit()
         self.txt_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self.txt_pass.setFont(QFont("B Nazanin", 11))
         layout.addWidget(self.txt_pass)
         
-        btn_login = QPushButton("ورود")
-        btn_login.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 6px;")
+        btn_login = QPushButton("ورود به سیستم")
+        btn_login.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
+        btn_login.setStyleSheet("background-color: #27ae60; color: white; padding: 6px;")
         btn_login.clicked.connect(self.check_password)
         layout.addWidget(btn_login)
         self.setLayout(layout)
@@ -155,9 +163,11 @@ class LoginDialog(QDialog):
         conn.close()
 
         if self.txt_pass.text() == saved_pass:
+            QMessageBox.information(self, "موفقیت", "رمز صحیح است، خوش آمدید!")
             self.accept()
         else:
-            QMessageBox.critical(self, "خطا", "رمز عبور اشتباه است!")
+            QMessageBox.critical(self, "خطا", "رمز اشتباه است، دوباره تلاش کنید")
+            self.txt_pass.clear()
 
 class StudioAccountingApp(QMainWindow):
     ROLES = ["تدوینگر", "عکاس", "فیلمبردار", "هلی شات و FPV کار", "اوپراتور کرین"]
@@ -169,7 +179,7 @@ class StudioAccountingApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("نرم‌افزار مدیریت مالی - IMART STUDIO v2.0")
+        self.setWindowTitle("نرم‌افزار مدیریت مالی - IMART STUDIO v3.0")
         self.resize(1200, 850)
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         
@@ -177,7 +187,7 @@ class StudioAccountingApp(QMainWindow):
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
-        self.setFont(QFont("Tahoma", 10))
+        self.setFont(QFont("B Yekan", 10))
         init_db()
         self.init_ui()
 
@@ -199,13 +209,16 @@ class StudioAccountingApp(QMainWindow):
         btn_about.clicked.connect(self.show_about)
 
         for btn in [btn_backup, btn_restore, btn_change_pass, btn_about]:
-            btn.setStyleSheet("padding: 5px 10px; font-weight: bold;")
+            btn.setFont(QFont("B Yekan", 9, QFont.Weight.Bold))
+            btn.setStyleSheet("padding: 5px 10px;")
             top_bar.addWidget(btn)
         top_bar.addStretch()
         main_layout.addLayout(top_bar)
 
         # زبانه اصلی (Tabs)
         self.tabs = QTabWidget()
+        self.tabs.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
+        
         self.tab_wedding = QWidget()
         self.tab_commercial = QWidget()
         self.tab_staff = QWidget()
@@ -229,13 +242,15 @@ class StudioAccountingApp(QMainWindow):
         # فوتر زیر برنامه
         footer = QLabel("ساخته شده در ایمارت استودیو")
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        footer.setStyleSheet("color: #7f8c8d; font-size: 9pt; margin-top: 5px;")
+        footer.setFont(QFont("B Nazanin", 9))
+        footer.setStyleSheet("color: #7f8c8d; margin-top: 5px;")
         main_layout.addWidget(footer)
 
     # --- زبانه ۱: عروس و داماد ---
     def setup_wedding_tab(self):
         layout = QHBoxLayout()
         form_box = QGroupBox("ثبت قرارداد جدید عروس و داماد")
+        form_box.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
         form_layout = QFormLayout()
 
         self.w_groom = QLineEdit()
@@ -244,6 +259,9 @@ class StudioAccountingApp(QMainWindow):
         self.w_bride_phone = QLineEdit()
         self.w_contract_date = QLineEdit(jdatetime.date.today().strftime("%Y/%m/%d"))
         self.w_ceremony_date = QLineEdit(jdatetime.date.today().strftime("%Y/%m/%d"))
+
+        for w in [self.w_groom, self.w_bride, self.w_groom_phone, self.w_bride_phone, self.w_contract_date, self.w_ceremony_date]:
+            w.setFont(QFont("B Nazanin", 10))
 
         form_layout.addRow("نام داماد:", self.w_groom)
         form_layout.addRow("نام عروس:", self.w_bride)
@@ -265,6 +283,7 @@ class StudioAccountingApp(QMainWindow):
 
         for item, price in prices.items():
             cb = QCheckBox(f"{item} ({price:,} تومان)")
+            cb.setFont(QFont("B Nazanin", 10))
             cb.stateChanged.connect(self.calc_wedding_total)
             self.item_checkboxes[item] = cb
             items_grid.addWidget(cb)
@@ -273,30 +292,34 @@ class StudioAccountingApp(QMainWindow):
         form_layout.addRow(items_box)
 
         self.w_lbl_total = QLabel("جمع کل: ۰ تومان")
-        self.w_lbl_total.setStyleSheet("font-weight: bold; color: #2c3e50;")
+        self.w_lbl_total.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
+        self.w_lbl_total.setStyleSheet("color: #2c3e50;")
         form_layout.addRow(self.w_lbl_total)
 
         self.w_deposit = QLineEdit("0")
         self.w_discount = QLineEdit("0")
         self.w_paid = QLineEdit("0")
-        self.w_deposit.textChanged.connect(self.calc_wedding_total)
-        self.w_discount.textChanged.connect(self.calc_wedding_total)
-        self.w_paid.textChanged.connect(self.calc_wedding_total)
+        for w in [self.w_deposit, self.w_discount, self.w_paid]:
+            w.setFont(QFont("B Nazanin", 10))
+            w.textChanged.connect(self.calc_wedding_total)
 
         form_layout.addRow("مبلغ بیعانه (تومان):", self.w_deposit)
         form_layout.addRow("تخفیف (تومان):", self.w_discount)
         form_layout.addRow("مبلغ پرداختی بعدی (تومان):", self.w_paid)
 
         self.w_bank_combo = QComboBox()
+        self.w_bank_combo.setFont(QFont("B Nazanin", 10))
         self.load_bank_combo()
         form_layout.addRow("بانک واریزی:", self.w_bank_combo)
 
         self.w_lbl_remain = QLabel("مانده حساب: ۰ تومان")
-        self.w_lbl_remain.setStyleSheet("font-weight: bold; color: #c0392b;")
+        self.w_lbl_remain.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
+        self.w_lbl_remain.setStyleSheet("color: #c0392b;")
         form_layout.addRow(self.w_lbl_remain)
 
         btn_save = QPushButton("ثبت قرارداد")
-        btn_save.setStyleSheet("background-color: #2980b9; color: white; font-weight: bold;")
+        btn_save.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
+        btn_save.setStyleSheet("background-color: #2980b9; color: white; padding: 6px;")
         btn_save.clicked.connect(self.save_wedding_contract)
         form_layout.addRow(btn_save)
 
@@ -305,8 +328,11 @@ class StudioAccountingApp(QMainWindow):
 
         # جدول قراردادها
         table_box = QGroupBox("لیست قراردادهای ثبت‌شده")
+        table_box.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
         table_layout = QVBoxLayout()
+        
         self.w_table = QTableWidget()
+        self.w_table.setFont(QFont("B Nazanin", 10))
         self.w_table.setColumnCount(10)
         self.w_table.setHorizontalHeaderLabels([
             "ID", "زوجین", "تماس", "تاریخ مراسم", "جمع کل", "تخفیف", "پرداختی", "مانده", "وضعیت", "پرینت PDF"
@@ -325,10 +351,7 @@ class StudioAccountingApp(QMainWindow):
         prices = dict(cursor.fetchall())
         conn.close()
 
-        total = 0
-        for item, cb in self.item_checkboxes.items():
-            if cb.isChecked():
-                total += prices.get(item, 0)
+        total = sum(prices.get(item, 0) for item, cb in self.item_checkboxes.items() if cb.isChecked())
 
         try:
             deposit = int(self.w_deposit.text() or 0)
@@ -420,6 +443,7 @@ class StudioAccountingApp(QMainWindow):
             self.w_table.setItem(r_idx, 8, status_item)
 
             btn_pdf = QPushButton("چاپ PDF")
+            btn_pdf.setFont(QFont("B Yekan", 9))
             btn_pdf.clicked.connect(lambda _, cid=c_id: self.export_wedding_pdf(cid))
             self.w_table.setCellWidget(r_idx, 9, btn_pdf)
 
@@ -437,21 +461,23 @@ class StudioAccountingApp(QMainWindow):
         pdf = canvas.Canvas(file_path, pagesize=letter)
         pdf.setFont("Helvetica-Bold", 18)
         pdf.drawString(220, 750, "IMART STUDIO")
+        pdf.setFont("Helvetica", 11)
+        pdf.drawString(225, 732, "Tel: 09173736618")
         pdf.setFont("Helvetica", 10)
-        pdf.drawString(200, 735, f"Date: {jdatetime.date.today().strftime('%Y/%m/%d')}")
-        pdf.line(50, 720, 550, 720)
+        pdf.drawString(200, 715, f"Date: {jdatetime.date.today().strftime('%Y/%m/%d')}")
+        pdf.line(50, 700, 550, 700)
 
         pdf.setFont("Helvetica", 12)
-        pdf.drawString(50, 690, f"Groom & Bride: {c[0]} & {c[1]}")
-        pdf.drawString(50, 670, f"Contract Date: {c[2]}  |  Ceremony Date: {c[3]}")
-        pdf.drawString(50, 650, f"Selected Services: {c[4]}")
-        pdf.line(50, 630, 550, 630)
+        pdf.drawString(50, 670, f"Groom & Bride: {c[0]} & {c[1]}")
+        pdf.drawString(50, 650, f"Contract Date: {c[2]}  |  Ceremony Date: {c[3]}")
+        pdf.drawString(50, 630, f"Selected Services: {c[4]}")
+        pdf.line(50, 610, 550, 610)
 
-        pdf.drawString(50, 600, f"Total Amount: {c[5]:,} Tomans")
-        pdf.drawString(50, 580, f"Discount: {c[6]:,} Tomans")
-        pdf.drawString(50, 560, f"Deposit & Paid: {c[7] + c[8]:,} Tomans")
+        pdf.drawString(50, 580, f"Total Amount: {c[5]:,} Tomans")
+        pdf.drawString(50, 560, f"Discount: {c[6]:,} Tomans")
+        pdf.drawString(50, 540, f"Deposit & Paid: {c[7] + c[8]:,} Tomans")
         remain = (c[5] - c[6]) - (c[7] + c[8])
-        pdf.drawString(50, 540, f"Remaining: {remain:,} Tomans")
+        pdf.drawString(50, 520, f"Remaining: {remain:,} Tomans")
 
         pdf.save()
         QMessageBox.information(self, "موفقیت", "فاکتور PDF ذخیره شد.")
@@ -460,6 +486,7 @@ class StudioAccountingApp(QMainWindow):
     def setup_commercial_tab(self):
         layout = QHBoxLayout()
         form_box = QGroupBox("ثبت پروژه تبلیغاتی / تولدی")
+        form_box.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
         form_layout = QFormLayout()
 
         self.c_title = QLineEdit()
@@ -471,6 +498,9 @@ class StudioAccountingApp(QMainWindow):
         self.c_paid = QLineEdit()
         self.c_date = QLineEdit(jdatetime.date.today().strftime("%Y/%m/%d"))
 
+        for w in [self.c_title, self.c_type, self.c_cameras, self.c_amount, self.c_paid, self.c_date]:
+            w.setFont(QFont("B Nazanin", 10))
+
         form_layout.addRow("عنوان پروژه:", self.c_title)
         form_layout.addRow("نوع پروژه:", self.c_type)
         form_layout.addRow("تعداد دوربین:", self.c_cameras)
@@ -479,7 +509,8 @@ class StudioAccountingApp(QMainWindow):
         form_layout.addRow("تاریخ پروژه:", self.c_date)
 
         btn_save = QPushButton("ثبت پروژه")
-        btn_save.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold;")
+        btn_save.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
+        btn_save.setStyleSheet("background-color: #27ae60; color: white; padding: 6px;")
         btn_save.clicked.connect(self.save_commercial_project)
         form_layout.addRow(btn_save)
 
@@ -487,6 +518,7 @@ class StudioAccountingApp(QMainWindow):
         layout.addWidget(form_box, 1)
 
         self.c_table = QTableWidget()
+        self.c_table.setFont(QFont("B Nazanin", 10))
         self.c_table.setColumnCount(7)
         self.c_table.setHorizontalHeaderLabels(["ID", "عنوان", "نوع", "تعداد دوربین", "مبلغ", "تاریخ", "چاپ PDF"])
         layout.addWidget(self.c_table, 2)
@@ -520,13 +552,14 @@ class StudioAccountingApp(QMainWindow):
             for c_idx, val in enumerate(row):
                 self.c_table.setItem(r_idx, c_idx, QTableWidgetItem(str(val)))
             btn_pdf = QPushButton("چاپ PDF")
+            btn_pdf.setFont(QFont("B Yekan", 9))
             self.c_table.setCellWidget(r_idx, 6, btn_pdf)
 
     # --- زبانه ۳: کارکنان ---
     def setup_staff_tab(self):
         layout = QVBoxLayout()
-        lbl = QLabel("بخش کارکنان و هزینه‌ها")
-        lbl.setFont(QFont("Tahoma", 12, QFont.Weight.Bold))
+        lbl = QLabel("بخش مدیریت کارکنان و هزینه‌ها")
+        lbl.setFont(QFont("B Yekan", 12, QFont.Weight.Bold))
         layout.addWidget(lbl)
         self.tab_staff.setLayout(layout)
 
@@ -534,6 +567,7 @@ class StudioAccountingApp(QMainWindow):
     def setup_inventory_tab(self):
         layout = QVBoxLayout()
         self.inv_table = QTableWidget()
+        self.inv_table.setFont(QFont("B Nazanin", 10))
         self.inv_table.setColumnCount(4)
         self.inv_table.setHorizontalHeaderLabels(["نام تجهیزات", "تعداد کل", "در حال استفاده", "باقی‌مانده"])
         layout.addWidget(self.inv_table)
@@ -549,7 +583,7 @@ class StudioAccountingApp(QMainWindow):
 
         self.inv_table.setRowCount(0)
         for r_idx, (name, total) in enumerate(rows):
-            used = 2  # تعداد فرضی در حال استفاده
+            used = 2
             remain = total - used
             self.inv_table.insertRow(r_idx)
             self.inv_table.setItem(r_idx, 0, QTableWidgetItem(name))
@@ -561,17 +595,22 @@ class StudioAccountingApp(QMainWindow):
     def setup_banks_tab(self):
         layout = QHBoxLayout()
         form_box = QGroupBox("افزودن حساب بانکی")
+        form_box.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
         form_layout = QFormLayout()
 
         self.b_name = QLineEdit()
         self.b_card = QLineEdit()
         self.b_sheba = QLineEdit()
 
+        for w in [self.b_name, self.b_card, self.b_sheba]:
+            w.setFont(QFont("B Nazanin", 10))
+
         form_layout.addRow("نام بانک:", self.b_name)
         form_layout.addRow("شماره کارت:", self.b_card)
         form_layout.addRow("شماره شبا:", self.b_sheba)
 
         btn_save = QPushButton("ذخیره کارت")
+        btn_save.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
         btn_save.clicked.connect(self.save_bank_card)
         form_layout.addRow(btn_save)
 
@@ -579,6 +618,7 @@ class StudioAccountingApp(QMainWindow):
         layout.addWidget(form_box, 1)
 
         self.b_table = QTableWidget()
+        self.b_table.setFont(QFont("B Nazanin", 10))
         self.b_table.setColumnCount(3)
         self.b_table.setHorizontalHeaderLabels(["نام بانک", "شماره کارت", "شماره شبا"])
         layout.addWidget(self.b_table, 2)
@@ -635,7 +675,7 @@ class StudioAccountingApp(QMainWindow):
     def show_about(self):
         msg = """
         <b>نرم‌افزار مدیریت مالی ایمارت استودیو</b><br>
-        <b>نسخه:</b> 2.0<br>
+        <b>نسخه:</b> 3.0<br>
         <b>طراح و توسعه‌دهنده:</b> میلاد محمدحسینی<br>
         <b>تلفن تماس:</b> 09171736249<br><br>
         <i>کلیه حقوق این نرم‌افزار متعلق به ایمارت استودیو می‌باشد.</i>
