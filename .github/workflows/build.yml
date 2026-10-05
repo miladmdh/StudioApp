@@ -33,5 +33,5 @@ jobs:
     - name: Upload Windows EXE
       uses: actions/upload-artifact@v4
       with:
-        name: Studio_Accounting_v3_Windows
+        name: Studio_Accounting_v4_Windows
         path: dist/app.exe
