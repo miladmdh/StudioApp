@@ -3,3 +3,4 @@ jdatetime
 openpyxl
 matplotlib
 pyinstaller
+reportlab
