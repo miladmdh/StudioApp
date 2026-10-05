@@ -7,15 +7,12 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QComboBox, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QGroupBox, QSpinBox, QFormLayout, QFileDialog,
-    QTabWidget, QCheckBox, QDialog
+    QTabWidget, QCheckBox, QInputDialog
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QIcon
 
 import openpyxl
-from openpyxl.styles import Font as XLFont, PatternFill, Alignment
-import matplotlib.pyplot as plt
-
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 
@@ -45,20 +42,6 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             role TEXT NOT NULL
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            trans_type TEXT NOT NULL,
-            category TEXT NOT NULL,
-            person_id INTEGER,
-            amount INTEGER NOT NULL,
-            year INTEGER NOT NULL,
-            month INTEGER NOT NULL,
-            day INTEGER NOT NULL,
-            description TEXT,
-            FOREIGN KEY (person_id) REFERENCES persons(id)
         )
     ''')
     cursor.execute('''
@@ -127,69 +110,41 @@ def init_db():
     conn.commit()
     conn.close()
 
-class LoginDialog(QDialog):
-    def __init__(self):
-        super().__init__()
-        self.setWindowTitle("ورود به نرم‌افزار ایمارت استودیو")
-        self.resize(340, 180)
-        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
-        
-        icon_path = resource_path("Accounting.png")
-        if os.path.exists(icon_path):
-            self.setWindowIcon(QIcon(icon_path))
-            
-        layout = QVBoxLayout()
-        lbl = QLabel("رمز عبور را وارد کنید:")
-        lbl.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
-        layout.addWidget(lbl)
-        
-        self.txt_pass = QLineEdit()
-        self.txt_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self.txt_pass.setFont(QFont("B Nazanin", 11))
-        layout.addWidget(self.txt_pass)
-        
-        btn_login = QPushButton("ورود به سیستم")
-        btn_login.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
-        btn_login.setStyleSheet("background-color: #27ae60; color: white; padding: 6px;")
-        btn_login.clicked.connect(self.check_password)
-        layout.addWidget(btn_login)
-        self.setLayout(layout)
-
-    def check_password(self):
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM settings WHERE key='app_password'")
-        saved_pass = cursor.fetchone()[0]
-        conn.close()
-
-        if self.txt_pass.text() == saved_pass:
-            QMessageBox.information(self, "موفقیت", "رمز صحیح است، خوش آمدید!")
-            self.accept()
-        else:
-            QMessageBox.critical(self, "خطا", "رمز اشتباه است، دوباره تلاش کنید")
-            self.txt_pass.clear()
-
 class StudioAccountingApp(QMainWindow):
-    ROLES = ["تدوینگر", "عکاس", "فیلمبردار", "هلی شات و FPV کار", "اوپراتور کرین"]
-    PROJECT_TYPES = ["عروسی", "عقد", "تولد", "تبلیغاتی", "قبض و کرایه"]
-    PERSIAN_MONTHS = [
-        "فروردین", "اردیبهشت", "خرداد", "تیر", "مرداد", "شهریور",
-        "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند"
-    ]
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("نرم‌افزار مدیریت مالی - IMART STUDIO v3.0")
         self.resize(1200, 850)
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         
+        # تنظیم آیکون پنجره
         icon_path = resource_path("Accounting.png")
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
         self.setFont(QFont("B Yekan", 10))
+        self.authenticated_tabs = set() # ثبت زبانه‌های تایید شده با رمز
         init_db()
         self.init_ui()
+
+    def verify_password(self):
+        """ متد احراز هویت با رمز عبور """
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM settings WHERE key='app_password'")
+        saved_pass = cursor.fetchone()[0]
+        conn.close()
+
+        entered_pass, ok = QInputDialog.getText(
+            self, "ورود بخش حفاظت‌شده", "لطفاً رمز عبور را وارد کنید:", QLineEdit.EchoMode.Password
+        )
+        if ok and entered_pass == saved_pass:
+            QMessageBox.information(self, "موفقیت", "رمز صحیح است، خوش آمدید!")
+            return True
+        elif ok:
+            QMessageBox.critical(self, "خطا", "رمز اشتباه است، دوباره تلاش کنید")
+            return False
+        return False
 
     def init_ui(self):
         main_widget = QWidget()
@@ -225,11 +180,14 @@ class StudioAccountingApp(QMainWindow):
         self.tab_inventory = QWidget()
         self.tab_banks = QWidget()
 
-        self.tabs.addTab(self.tab_wedding, "پروژه‌های عروس و داماد")
-        self.tabs.addTab(self.tab_commercial, "تبلیغاتی / بیوتی / تولدی")
-        self.tabs.addTab(self.tab_staff, "بخش کارکنان و هزینه‌ها")
+        self.tabs.addTab(self.tab_wedding, "پروژه‌های عروس و داماد 🔒")
+        self.tabs.addTab(self.tab_commercial, "تبلیغاتی / بیوتی / تولدی 🔒")
+        self.tabs.addTab(self.tab_staff, "بخش کارکنان و هزینه‌ها 🔒")
         self.tabs.addTab(self.tab_inventory, "انبار تجهیزات")
         self.tabs.addTab(self.tab_banks, "کارت‌های بانکی")
+
+        # چک کردن رمز هنگام تعویض زبانه
+        self.tabs.currentChanged.connect(self.on_tab_change)
 
         main_layout.addWidget(self.tabs)
 
@@ -240,11 +198,20 @@ class StudioAccountingApp(QMainWindow):
         self.setup_banks_tab()
 
         # فوتر زیر برنامه
-        footer = QLabel("ساخته شده در ایمارت استودیو")
+        footer = QLabel("IMART STUDIO - Phone: 09173736618")
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        footer.setFont(QFont("B Nazanin", 9))
-        footer.setStyleSheet("color: #7f8c8d; margin-top: 5px;")
+        footer.setFont(QFont("B Nazanin", 10, QFont.Weight.Bold))
+        footer.setStyleSheet("color: #2c3e50; margin-top: 5px;")
         main_layout.addWidget(footer)
+
+    def on_tab_change(self, index):
+        # زبانه‌های 0، 1 و 2 نیاز به رمز دارند
+        if index in [0, 1, 2] and index not in self.authenticated_tabs:
+            if self.verify_password():
+                self.authenticated_tabs.add(index)
+            else:
+                # اگر رمز اشتباه بود برگرد به زبانه عمومی (انبار)
+                self.tabs.setCurrentIndex(3)
 
     # --- زبانه ۱: عروس و داماد ---
     def setup_wedding_tab(self):
@@ -583,7 +550,7 @@ class StudioAccountingApp(QMainWindow):
 
         self.inv_table.setRowCount(0)
         for r_idx, (name, total) in enumerate(rows):
-            used = 2
+            used = 0
             remain = total - used
             self.inv_table.insertRow(r_idx)
             self.inv_table.setItem(r_idx, 0, QTableWidgetItem(name))
@@ -649,43 +616,44 @@ class StudioAccountingApp(QMainWindow):
             for c_idx, val in enumerate(row):
                 self.b_table.setItem(r_idx, c_idx, QTableWidgetItem(str(val)))
 
-    # --- امکانات کلی سیستم ---
+    # --- امکانات عمومی ---
     def backup_db(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "ذخیره فایل پشتیبان", "studio_backup.db", "Database Files (*.db)")
-        if file_path:
-            shutil.copyfile(DB_NAME, file_path)
-            QMessageBox.information(self, "پشتیبان‌گیری", "فایل پشتیبان با موفقیت ذخیره شد.")
+        if self.verify_password():
+            file_path, _ = QFileDialog.getSaveFileName(self, "ذخیره فایل پشتیبان", "studio_backup.db", "Database Files (*.db)")
+            if file_path:
+                shutil.copyfile(DB_NAME, file_path)
+                QMessageBox.information(self, "پشتیبان‌گیری", "فایل پشتیبان با موفقیت ذخیره شد.")
 
     def restore_db(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "انتخاب فایل پشتیبان", "", "Database Files (*.db)")
-        if file_path:
-            shutil.copyfile(file_path, DB_NAME)
-            QMessageBox.information(self, "بازیابی", "اطلاعات با موفقیت بازیابی شد. برنامه را مجدداً باز کنید.")
+        if self.verify_password():
+            file_path, _ = QFileDialog.getOpenFileName(self, "انتخاب فایل پشتیبان", "", "Database Files (*.db)")
+            if file_path:
+                shutil.copyfile(file_path, DB_NAME)
+                QMessageBox.information(self, "بازیابی", "اطلاعات با موفقیت بازیابی شد. برنامه را مجدداً باز کنید.")
 
     def change_password(self):
-        new_pass, ok = QLineEdit.getText(self, "تغییر رمز عبور", "رمز عبور جدید را وارد کنید:")
-        if ok and new_pass:
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE settings SET value=? WHERE key='app_password'", (new_pass,))
-            conn.commit()
-            conn.close()
-            QMessageBox.information(self, "موفقیت", "رمز عبور با موفقیت تغییر کرد.")
+        if self.verify_password():
+            new_pass, ok = QInputDialog.getText(self, "تغییر رمز عبور", "رمز عبور جدید را وارد کنید:")
+            if ok and new_pass:
+                conn = sqlite3.connect(DB_NAME)
+                cursor = conn.cursor()
+                cursor.execute("UPDATE settings SET value=? WHERE key='app_password'", (new_pass,))
+                conn.commit()
+                conn.close()
+                QMessageBox.information(self, "موفقیت", "رمز عبور با موفقیت تغییر کرد.")
 
     def show_about(self):
         msg = """
         <b>نرم‌افزار مدیریت مالی ایمارت استودیو</b><br>
         <b>نسخه:</b> 3.0<br>
         <b>طراح و توسعه‌دهنده:</b> میلاد محمدحسینی<br>
-        <b>تلفن تماس:</b> 09171736249<br><br>
+        <b>تلفن تماس:</b> 09173736618<br><br>
         <i>کلیه حقوق این نرم‌افزار متعلق به ایمارت استودیو می‌باشد.</i>
         """
         QMessageBox.about(self, "درباره برنامه", msg)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    login = LoginDialog()
-    if login.exec() == QDialog.DialogCode.Accepted:
-        window = StudioAccountingApp()
-        window.show()
-        sys.exit(app.exec())
+    window = StudioAccountingApp()
+    window.show()
+    sys.exit(app.exec())
