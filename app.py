@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QHeaderView, QMessageBox, QGroupBox, QSpinBox, QFormLayout, QFileDialog,
     QTabWidget, QCheckBox, QInputDialog, QDialog, QStackedWidget, QFrame
 )
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QIcon
 
 import openpyxl
@@ -345,7 +345,6 @@ class StudioAccountingApp(QMainWindow):
             self.setWindowIcon(QIcon(icon_path))
 
         self.setFont(QFont("B Yekan", 10))
-        init_db()
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -356,10 +355,6 @@ class StudioAccountingApp(QMainWindow):
         self.main_app_screen = QWidget()
         self.stack.addWidget(self.main_app_screen)
 
-        self.setup_dashboard_ui()
-        self.setup_main_app_ui()
-        self.stack.setCurrentWidget(self.dashboard_screen)
-
     def prompt_login(self):
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -368,12 +363,15 @@ class StudioAccountingApp(QMainWindow):
         conn.close()
 
         entered_pass, ok = QInputDialog.getText(
-            self, "ورود به نرم‌افزار IMART STUDIO", "لطفاً رمز عبور را وارد کنید:", QLineEdit.EchoMode.Password
+            None, "ورود به نرم‌افزار IMART STUDIO", "لطفاً رمز عبور را وارد کنید:", QLineEdit.EchoMode.Password
         )
 
-        if not (ok and entered_pass == saved_pass):
-            QMessageBox.critical(self, "خطا", "رمز عبور اشتباه است!")
-            sys.exit()
+        if ok and entered_pass == saved_pass:
+            return True
+        else:
+            if ok:
+                QMessageBox.critical(None, "خطا", "رمز عبور اشتباه است!")
+            return False
 
     def setup_dashboard_ui(self):
         layout = QVBoxLayout()
@@ -1315,7 +1313,16 @@ class StudioAccountingApp(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = StudioAccountingApp()
-    window.show()
-    QTimer.singleShot(100, window.prompt_login)
-    sys.exit(app.exec())
+    
+    init_db()
+    
+    main_window = StudioAccountingApp()
+    
+    if main_window.prompt_login():
+        main_window.setup_dashboard_ui()
+        main_window.setup_main_app_ui()
+        main_window.stack.setCurrentWidget(main_window.dashboard_screen)
+        main_window.show()
+        sys.exit(app.exec())
+    else:
+        sys.exit(0)
