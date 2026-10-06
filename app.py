@@ -590,7 +590,6 @@ class StudioAccountingApp(QMainWindow):
         btn_manage_items.clicked.connect(self.open_manage_items)
         form_layout.addRow(btn_manage_items)
 
-        # اسکرول بار برای موارد فاکتور جهت جلوگیری از بهم ریختگی
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setFixedHeight(180)
@@ -825,7 +824,6 @@ class StudioAccountingApp(QMainWindow):
             btn_dep.clicked.connect(lambda _, cid=c_id: self.open_deposits_dialog(cid))
             self.w_table.setCellWidget(r_idx, 10, btn_dep)
 
-            # دکمه چاپ مستقیم و PDF
             print_widget = QWidget()
             print_layout = QHBoxLayout()
             print_layout.setContentsMargins(0, 0, 0, 0)
@@ -1621,31 +1619,38 @@ class StudioAccountingApp(QMainWindow):
 
         form_box.setLayout(form_layout)
         layout.addWidget(form_box)
+        layout.addStretch()
         self.tab_receipt.setLayout(layout)
 
     def print_receipt(self):
         name = self.rc_name.text().strip()
-        amount = self.rc_amount.text().strip()
-        if not name or not amount:
-            QMessageBox.warning(self, "خطا", "لطفاً اطلاعات رسید را تکمیل کنید.")
+        amount = parse_number(self.rc_amount.text())
+        if not name or amount <= 0:
+            QMessageBox.warning(self, "خطا", "لطفاً نام پرداخت‌کننده و مبلغ را به درستی وارد کنید.")
             return
 
-        html_receipt = f"""
-        <div dir="rtl" style="font-family: '{APP_FONT_FAMILY}', 'Tahoma'; padding: 30px; border: 2px solid #000; width: 80%; margin: auto;">
-            <h2 style="text-align: center;">IMART STUDIO</h2>
-            <h3 style="text-align: center;">رسید دریافت وجه / بیعانه</h3>
+        html_content = f"""
+        <div dir="rtl" style="font-family: '{APP_FONT_FAMILY}', 'Tahoma'; padding: 30px; border: 2px solid #2c3e50; border-radius: 10px;">
+            <h2 style="text-align: center; color: #1F4E78; margin-bottom: 5px;">IMART STUDIO</h2>
+            <h3 style="text-align: center; margin-top: 0;">رسید دریافتی وجه / بیعانه</h3>
             <hr>
-            <p><b>تاریخ:</b> {self.rc_date.text()}</p>
-            <p>مبلغ <b>{amount} تومان</b> از آقا/خانم <b>{name}</b> بابت <b>{self.rc_for.text()}</b> به حسابداری تحویل گردید.</p>
-            <br>
-            <p style="color: red; font-weight: bold; text-align: center;">* بیعانه پرداختی پس داده نمی‌شود. *</p>
-            <br><br>
-            <p style="text-align: left; margin-left: 50px;"><b>امضای حسابداری:</b></p>
+            <p style="font-size: 14pt; line-height: 2;">
+                بدین‌‌وسیله گواهی می‌شود مبلغ <b>{amount:,} تومان</b> 
+                از جناب آقای / سرکار خانم <b>{name}</b> 
+                بابت <b>{self.rc_for.text()}</b> در تاریخ <b>{self.rc_date.text()}</b> دریافت گردید.
+            </p>
+            <br><br><br>
+            <table style="width: 100%; text-align: center; font-size: 12pt;">
+                <tr>
+                    <td>امضاء دریافت‌کننده (IMART STUDIO)</td>
+                    <td>امضاء و مهر پرداخت‌کننده</td>
+                </tr>
+            </table>
         </div>
         """
 
         doc = QTextDocument()
-        doc.setHtml(html_receipt)
+        doc.setHtml(html_content)
         printer = QPrinter(QPrinter.PrinterMode.HighResolution)
         dialog = QPrintDialog(printer, self)
         if dialog.exec() == QPrintDialog.DialogCode.Accepted:
@@ -1654,103 +1659,115 @@ class StudioAccountingApp(QMainWindow):
     # --- زبانه ۱۱: سال کاری ---
     def setup_workyear_tab(self):
         layout = QVBoxLayout()
-        lbl = QLabel("مدیریت و بایگانی پروژه‌ها بر اساس سال کاری")
-        lbl.setFont(QFont(APP_FONT_FAMILY, 12, QFont.Weight.Bold))
-        layout.addWidget(lbl)
+        box = QGroupBox("مدیریت سال کاری و بستن حساب‌ها")
+        box.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
+        vbox = QVBoxLayout()
 
-        self.spin_workyear = QSpinBox()
-        self.spin_workyear.setRange(1390, 1450)
-        self.spin_workyear.setValue(jdatetime.date.today().year)
-        layout.addWidget(self.spin_workyear)
+        lbl_info = QLabel("بستن سال کاری تمامی اطلاعات قراردادها، هزینه‌ها و پروژه‌ها را به یک فایل پشتیبان با نام سال منتقل کرده و جدول‌ها را جهت شروع سال کاری جدید خالی می‌کند.")
+        lbl_info.setWordWrap(True)
+        vbox.addWidget(lbl_info)
 
-        btn_calc = QPushButton("محاسبه وضعیت سال کاری")
-        btn_calc.clicked.connect(self.calc_workyear)
-        layout.addWidget(btn_calc)
+        btn_close_year = QPushButton("🔒 بستن سال کاری و انتقال به سال جدید")
+        btn_close_year.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; padding: 10px;")
+        btn_close_year.clicked.connect(self.close_work_year)
+        vbox.addWidget(btn_close_year)
 
-        self.lbl_workyear_res = QLabel("اطلاعات سال کاری...")
-        self.lbl_workyear_res.setStyleSheet("font-size: 11pt; padding: 15px; background-color: #f8f9fa; border-radius: 8px;")
-        layout.addWidget(self.lbl_workyear_res)
-
+        box.setLayout(vbox)
+        layout.addWidget(box)
+        layout.addStretch()
         self.tab_workyear.setLayout(layout)
 
-    def calc_workyear(self):
-        year = str(self.spin_workyear.value())
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
+    def close_work_year(self):
+        if not ask_security_password(self): return
 
-        cursor.execute("SELECT COUNT(*), SUM(total_amount) FROM wedding_contracts WHERE contract_date LIKE ?", (f"{year}%",))
-        w_cnt, w_sum = cursor.fetchone()
+        reply = QMessageBox.question(self, "تایید نهایی", "آیا مطمئن هستید که می‌خواهید سال کاری را ببندید؟ از دیتابیس فعلی بک‌آپ گرفته خواهد شد.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            today_str = jdatetime.date.today().strftime("%Y_%m_%d")
+            backup_name = f"studio_accounting_archive_{today_str}.db"
+            shutil.copy(DB_NAME, backup_name)
 
-        cursor.execute("SELECT COUNT(*), SUM(total_amount) FROM commercial_projects WHERE project_date LIKE ?", (f"{year}%",))
-        c_cnt, c_sum = cursor.fetchone()
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM wedding_contracts")
+            cursor.execute("DELETE FROM wedding_deposits")
+            cursor.execute("DELETE FROM commercial_projects")
+            cursor.execute("DELETE FROM expenses")
+            cursor.execute("DELETE FROM transactions")
+            cursor.execute("DELETE FROM checks")
+            cursor.execute("UPDATE inventory SET used_count=0")
+            conn.commit()
+            conn.close()
 
-        conn.close()
-
-        w_sum = w_sum or 0
-        c_sum = c_sum or 0
-        self.lbl_workyear_res.setText(
-            f"<b>نتایج سال کاری {year}:</b><br><br>"
-            f"تعداد قراردادهای عروس و داماد: <b>{w_cnt}</b> عدد (جمع: {w_sum:,} تومان)<br>"
-            f"تعداد پروژه‌های تبلیغاتی: <b>{c_cnt}</b> عدد (جمع: {c_sum:,} تومان)<br>"
-            f"مجموع درآمد سال کاری {year}: <b>{w_sum + c_sum:,} تومان</b>"
-        )
+            QMessageBox.information(self, "موفقیت", f"سال کاری با موفقیت بسته شد. فایل آرشیو با نام {backup_name} ذخیره گردید.")
+            self.load_wedding_contracts()
+            self.load_commercial_projects()
+            self.load_expenses_table()
+            self.load_staff_table()
+            self.load_inventory()
 
     # --- زبانه ۱۲: درباره برنامه ---
     def setup_about_tab(self):
         layout = QVBoxLayout()
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        lbl_title = QLabel("IMART STUDIO ACCOUNTING v8.0")
-        lbl_title.setFont(QFont(APP_FONT_FAMILY, 16, QFont.Weight.Bold))
-        lbl_title.setStyleSheet("color: #2c3e50;")
+        card = QGroupBox("درباره نرم‌افزار IMART STUDIO")
+        card_layout = QVBoxLayout()
 
-        lbl_dev = QLabel("طراح و توسعه‌دهنده: میلاد محمدحسینی")
-        lbl_dev.setFont(QFont(APP_FONT_FAMILY, 12))
+        lbl_title = QLabel("نرم‌افزار جامع مدیریت مالی و حسابداری IMART STUDIO")
+        lbl_title.setFont(QFont(APP_FONT_FAMILY, 14, QFont.Weight.Bold))
+        lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        lbl_copy = QLabel("کلیه حقوق این نرم‌افزار متعلق به ای‌مارت استودیو (IMART STUDIO) می‌باشد.")
-        lbl_copy.setFont(QFont(APP_FONT_FAMILY, 10))
-        lbl_copy.setStyleSheet("color: #7f8c8d;")
+        lbl_desc = QLabel(
+            "نسخه: ۸.۰\n"
+            "طراحی و توسعه اختصاصی جهت آتلیه‌ها، استودیوهای فیلمبرداری و پروژه‌های تولید محتوا.\n\n"
+            "📞 شماره تماس پشتیبانی: 09173736618\n"
+            "تمامی حقوق این نرم‌افزار محفوظ می‌باشد."
+        )
+        lbl_desc.setFont(QFont(APP_FONT_FAMILY, 11))
+        lbl_desc.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        layout.addWidget(lbl_title)
-        layout.addWidget(lbl_dev)
-        layout.addWidget(lbl_copy)
+        card_layout.addWidget(lbl_title)
+        card_layout.addWidget(lbl_desc)
+        card.setLayout(card_layout)
 
+        layout.addWidget(card)
         self.tab_about.setLayout(layout)
 
-    # --- متدهای پشتیبان‌گیری و تغییر رمز ---
+    # --- متدهای عمومی بک‌آپ، ریستور و تغییر رمز ---
     def backup_db(self):
-        file_path, _ = QFileDialog.getSaveFileName(self, "ذخیره پشتیبان", "studio_backup.db", "Database Files (*.db)")
+        file_path, _ = QFileDialog.getSaveFileName(self, "ذخیره فایل پشتیبان", f"backup_{jdatetime.date.today().strftime('%Y_%m_%d')}.db", "Database Files (*.db)")
         if file_path:
-            shutil.copyfile(DB_NAME, file_path)
-            QMessageBox.information(self, "پشتیبان‌گیری", "پشتیبان‌گیری با موفقیت انجام شد.")
+            shutil.copy(DB_NAME, file_path)
+            QMessageBox.information(self, "موفقیت", "پشتیبان‌گیری با موفقیت انجام شد.")
 
     def restore_db(self):
+        if not ask_security_password(self): return
         file_path, _ = QFileDialog.getOpenFileName(self, "انتخاب فایل پشتیبان", "", "Database Files (*.db)")
         if file_path:
-            shutil.copyfile(file_path, DB_NAME)
-            QMessageBox.information(self, "بازیابی", "اطلاعات با موفقیت بازیابی شد.")
+            shutil.copy(file_path, DB_NAME)
+            QMessageBox.information(self, "موفقیت", "پایگاه داده با موفقیت بازیابی شد. برنامه را دوباره اجرا کنید.")
 
     def change_password(self):
         if not ask_security_password(self): return
-        new_pass, ok = QInputDialog.getText(self, "تغییر رمز عبور", "رمز عبور جدید را وارد کنید:")
-        if ok and new_pass:
+        new_pass, ok = QInputDialog.getText(self, "تغییر رمز عبور", "رمز عبور جدید را وارد کنید:", QLineEdit.EchoMode.Password)
+        if ok and new_pass.strip():
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
-            cursor.execute("UPDATE settings SET value=? WHERE key='app_password'", (new_pass,))
+            cursor.execute("UPDATE settings SET value=? WHERE key='app_password'", (new_pass.strip(),))
             conn.commit()
             conn.close()
-            QMessageBox.information(self, "موفقیت", "رمز عبور تغییر یافت.")
+            QMessageBox.information(self, "موفقیت", "رمز عبور جدید با موفقیت ثبت گردید.")
 
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
+# --- نقطه‌ی ورود و اجرای برنامه ---
+if __name__ == '__main__':
     init_db()
+    app = QApplication(sys.argv)
     
-    main_window = StudioAccountingApp()
-    if main_window.prompt_login():
-        main_window.setup_dashboard_ui()
-        main_window.setup_main_app_ui()
-        main_window.stack.setCurrentWidget(main_window.dashboard_screen)
-        main_window.show()
+    main_win = StudioAccountingApp()
+    if main_win.prompt_login():
+        main_win.setup_dashboard_ui()
+        main_win.setup_main_app_ui()
+        main_win.show()
         sys.exit(app.exec())
     else:
         sys.exit(0)
