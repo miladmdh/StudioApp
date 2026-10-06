@@ -511,8 +511,6 @@ class StudioAccountingApp(QMainWindow):
         items_box.setLayout(items_box_layout)
         form_layout.addRow(items_box)
 
-        self.load_item_checkboxes()
-
         self.w_lbl_total = QLabel("جمع کل: ۰ تومان")
         self.w_lbl_total.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
         self.w_lbl_total.setStyleSheet("color: #2c3e50;")
@@ -535,6 +533,9 @@ class StudioAccountingApp(QMainWindow):
         self.w_lbl_remain.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
         self.w_lbl_remain.setStyleSheet("color: #c0392b;")
         form_layout.addRow(self.w_lbl_remain)
+
+        # فراخوانی لود چک‌باکس‌ها بعد از تعریف w_discount و w_first_deposit
+        self.load_item_checkboxes()
 
         btn_save = QPushButton("ثبت نهایی قرارداد")
         btn_save.setFont(QFont("B Yekan", 10, QFont.Weight.Bold))
@@ -570,7 +571,9 @@ class StudioAccountingApp(QMainWindow):
 
     def load_item_checkboxes(self):
         for i in reversed(range(self.items_vbox.count())): 
-            self.items_vbox.itemAt(i).widget().setParent(None)
+            widget = self.items_vbox.itemAt(i).widget()
+            if widget:
+                widget.setParent(None)
 
         self.item_checkboxes = {}
         self.item_price_inputs = {}
@@ -619,6 +622,9 @@ class StudioAccountingApp(QMainWindow):
         self.calc_wedding_total()
 
     def calc_wedding_total(self):
+        if not hasattr(self, 'w_discount') or not hasattr(self, 'w_first_deposit'):
+            return
+
         selected_sum = 0
         for item_name, cb in self.item_checkboxes.items():
             if cb.isChecked():
@@ -1286,7 +1292,7 @@ class StudioAccountingApp(QMainWindow):
         file_path, _ = QFileDialog.getSaveFileName(self, "ذخیره فایل پشتیبان", "studio_backup.db", "Database Files (*.db)")
         if file_path:
             shutil.copyfile(DB_NAME, file_path)
-            QMessageBox.information(self, "پشتیبان‌گیری", "پشتیبان‌گیری با موفقیت انجام شد.")
+            QMessageBox.information(self, "پشتیبان‌گیری", "پشتیبان‌‌گیری با موفقیت انجام شد.")
 
     def restore_db(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "انتخاب فایل پشتیبان", "", "Database Files (*.db)")
@@ -1305,7 +1311,7 @@ class StudioAccountingApp(QMainWindow):
             QMessageBox.information(self, "موفقیت", "رمز عبور تغییر یافت.")
 
     def closeEvent(self, event):
-        reply = QMessageBox.question(self, "پشتیبان‌گیری خودکار", "آیا مایلید قبل از خروج فایل بک‌آپ ذخیره شود؟",
+        reply = QMessageBox.question(self, "پشتیبان‌گیری خودکار", "آیا مایلید قبل از خروج فایل بک‌‌آپ ذخیره شود؟",
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             self.backup_db()
