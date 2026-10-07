@@ -10,10 +10,11 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QComboBox, QPushButton, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QGroupBox, QSpinBox, QFormLayout, QFileDialog,
     QTabWidget, QCheckBox, QInputDialog, QDialog, QStackedWidget, QFrame,
-    QTextEdit, QScrollArea, QTreeWidget, QTreeWidgetItem, QDateEdit
+    QTextEdit, QScrollArea, QTreeWidget, QTreeWidgetItem, QDateEdit,
+    QProgressBar, QGraphicsDropShadowEffect
 )
-from PyQt6.QtCore import Qt, QDate
-from PyQt6.QtGui import QFont, QIcon, QColor, QFontDatabase, QTextDocument
+from PyQt6.QtCore import Qt, QDate, QTimer
+from PyQt6.QtGui import QFont, QIcon, QColor, QFontDatabase, QTextDocument, QPixmap, QPainter, QLinearGradient, QBrush
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog
 
 import openpyxl
@@ -33,8 +34,12 @@ except Exception:
 
 DB_NAME = "studio_accounting.db"
 
-# مدیریت فونت‌های نرم‌افزار
+# ⚠️ مقدار پیش‌فرض فونت (بعد از ساخت QApplication نهایی می‌شود)
+APP_FONT_FAMILY = "Tahoma"
+
+
 def setup_fonts():
+    """تشخیص فونت مناسب فارسی - باید بعد از ساخت QApplication صدا زده شود"""
     font_family = "B Yekan"
     available_fonts = QFontDatabase.families()
     if "B Yekan" not in available_fonts and "B Nazanin" in available_fonts:
@@ -43,7 +48,6 @@ def setup_fonts():
         font_family = "Tahoma"
     return font_family
 
-APP_FONT_FAMILY = setup_fonts()
 
 def resource_path(relative_path):
     try:
@@ -51,6 +55,7 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
 
 def format_number(val):
     try:
@@ -61,17 +66,20 @@ def format_number(val):
     except ValueError:
         return str(val)
 
+
 def parse_number(val_str):
     try:
         return int(str(val_str).replace(',', '').strip())
     except ValueError:
         return 0
 
+
 def ask_security_password(parent):
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT value FROM settings WHERE key='app_password'")
-    saved_pass = cursor.fetchone()[0]
+    row = cursor.fetchone()
+    saved_pass = row[0] if row else "123"
     conn.close()
 
     entered_pass, ok = QInputDialog.getText(
@@ -84,15 +92,16 @@ def ask_security_password(parent):
         return False
     return False
 
+
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
+
     cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
     cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('app_password', '123')")
-    
+
     cursor.execute('''CREATE TABLE IF NOT EXISTS persons (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, role TEXT NOT NULL)''')
-    
+
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -146,6 +155,114 @@ def init_db():
     conn.commit()
     conn.close()
 
+
+# --- پنجره بارگذاری (Loading Screen) ---
+class LoadingScreen(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("IMART STUDIO - در حال بارگذاری...")
+        self.setFixedSize(550, 340)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        # کادر اصلی با گرادیانت
+        self.container = QFrame(self)
+        self.container.setGeometry(0, 0, 550, 340)
+        self.container.setStyleSheet("""
+            QFrame {
+                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:1,
+                    stop:0 #1F4E78, stop:0.5 #2c3e50, stop:1 #34495e);
+                border-radius: 18px;
+                border: 2px solid #2980b9;
+            }
+        """)
+
+        # سایه زیر پنجره
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(30)
+        shadow.setColor(QColor(0, 0, 0, 180))
+        shadow.setOffset(0, 6)
+        self.container.setGraphicsEffect(shadow)
+
+        layout = QVBoxLayout(self.container)
+        layout.setContentsMargins(35, 30, 35, 30)
+        layout.setSpacing(15)
+
+        # لوگو / نام استودیو
+        self.lbl_logo = QLabel("🎬 IMART STUDIO")
+        self.lbl_logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_logo.setStyleSheet("color: white; font-size: 26pt; font-weight: bold; background: transparent;")
+        layout.addWidget(self.lbl_logo)
+
+        # زیرعنوان
+        self.lbl_sub = QLabel("سیستم جامع مدیریت مالی و حسابداری - نسخه ۸.۰")
+        self.lbl_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_sub.setStyleSheet("color: #aed6f1; font-size: 11pt; background: transparent;")
+        layout.addWidget(self.lbl_sub)
+
+        layout.addSpacing(10)
+
+        # درصد
+        self.lbl_percent = QLabel("0%")
+        self.lbl_percent.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_percent.setStyleSheet("color: #f1c40f; font-size: 32pt; font-weight: bold; background: transparent;")
+        layout.addWidget(self.lbl_percent)
+
+        # نوار پیشرفت
+        self.progress = QProgressBar()
+        self.progress.setFixedHeight(20)
+        self.progress.setTextVisible(False)
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setStyleSheet("""
+            QProgressBar {
+                background-color: rgba(255, 255, 255, 30);
+                border-radius: 10px;
+                border: 1px solid rgba(255, 255, 255, 60);
+            }
+            QProgressBar::chunk {
+                background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #27ae60, stop:0.5 #2ecc71, stop:1 #1abc9c);
+                border-radius: 10px;
+            }
+        """)
+        layout.addWidget(self.progress)
+
+        # متن مرحله فعلی
+        self.lbl_status = QLabel("در حال آماده‌سازی...")
+        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_status.setStyleSheet("color: white; font-size: 11pt; background: transparent;")
+        layout.addWidget(self.lbl_status)
+
+        layout.addStretch()
+
+        # فوتر
+        self.lbl_footer = QLabel("📞 09173736618")
+        self.lbl_footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_footer.setStyleSheet("color: #bdc3c7; font-size: 9pt; background: transparent;")
+        layout.addWidget(self.lbl_footer)
+
+        # Layout خارجی برای جاگذاری container
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.container)
+
+        self.center_on_screen()
+
+    def center_on_screen(self):
+        screen = QApplication.primaryScreen().geometry()
+        x = (screen.width() - self.width()) // 2
+        y = (screen.height() - self.height()) // 2
+        self.move(x, y)
+
+    def set_progress(self, value, status_text=""):
+        self.progress.setValue(value)
+        self.lbl_percent.setText(f"{value}%")
+        if status_text:
+            self.lbl_status.setText(status_text)
+        QApplication.processEvents()
+
+
 # --- پنجره مدیریت فاکتور و پکیج‌ها ---
 class ManageItemsDialog(QDialog):
     def __init__(self, parent=None):
@@ -161,7 +278,7 @@ class ManageItemsDialog(QDialog):
         self.txt_item_name = QLineEdit()
         self.txt_item_price = QLineEdit()
         self.txt_item_price.textChanged.connect(lambda t: self.txt_item_price.setText(format_number(t)))
-        
+
         self.chk_is_package = QCheckBox("این مورد یک پکیج اصلی است")
         self.chk_is_package.stateChanged.connect(self.toggle_package_mode)
 
@@ -229,7 +346,8 @@ class ManageItemsDialog(QDialog):
         self.tree.expandAll()
 
     def add_or_update_item(self):
-        if not ask_security_password(self): return
+        if not ask_security_password(self):
+            return
 
         name = self.txt_item_name.text().strip()
         price = parse_number(self.txt_item_price.text())
@@ -262,7 +380,8 @@ class ManageItemsDialog(QDialog):
             return
 
         item_name = selected.text(0).replace("  └ ", "").strip()
-        if not ask_security_password(self): return
+        if not ask_security_password(self):
+            return
 
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -273,6 +392,7 @@ class ManageItemsDialog(QDialog):
 
         self.load_packages_combo()
         self.load_tree_items()
+
 
 # --- پنجره مدیریت بیعانه‌ها ---
 class DepositsDialog(QDialog):
@@ -351,10 +471,11 @@ class DepositsDialog(QDialog):
         cursor.execute("SELECT SUM(amount) FROM wedding_deposits WHERE contract_id=?", (self.contract_id,))
         total_paid = cursor.fetchone()[0] or 0
         cursor.execute("SELECT total_amount, discount FROM wedding_contracts WHERE id=?", (self.contract_id,))
-        tot, disc = cursor.fetchone()
-
-        is_settled = 1 if (tot - disc - total_paid) <= 0 else 0
-        cursor.execute("UPDATE wedding_contracts SET paid_amount=?, is_settled=? WHERE id=?", (total_paid, is_settled, self.contract_id))
+        result = cursor.fetchone()
+        if result:
+            tot, disc = result
+            is_settled = 1 if (tot - disc - total_paid) <= 0 else 0
+            cursor.execute("UPDATE wedding_contracts SET paid_amount=?, is_settled=? WHERE id=?", (total_paid, is_settled, self.contract_id))
 
         conn.commit()
         conn.close()
@@ -362,6 +483,7 @@ class DepositsDialog(QDialog):
         self.txt_amount.clear()
         self.load_deposits()
         QMessageBox.information(self, "موفقیت", "بیعانه با موفقیت ثبت شد.")
+
 
 # --- پنجره جزئیات قرارداد ---
 class ContractDetailsDialog(QDialog):
@@ -409,6 +531,7 @@ class ContractDetailsDialog(QDialog):
 
         self.setLayout(layout)
 
+
 # --- کلاس اصلی برنامه ---
 class StudioAccountingApp(QMainWindow):
     ROLES = ["تدوینگر", "عکاس", "فیلمبردار", "هلی شات و FPV کار", "اوپراتور کرین"]
@@ -427,6 +550,7 @@ class StudioAccountingApp(QMainWindow):
 
         self.setFont(QFont(APP_FONT_FAMILY, 10))
 
+        # ساخت استک و صفحات
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
 
@@ -436,11 +560,15 @@ class StudioAccountingApp(QMainWindow):
         self.main_app_screen = QWidget()
         self.stack.addWidget(self.main_app_screen)
 
+        # اطمینان از اینکه داشبورد به عنوان صفحه پیش‌فرض نمایش داده شود
+        self.stack.setCurrentWidget(self.dashboard_screen)
+
     def prompt_login(self):
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("SELECT value FROM settings WHERE key='app_password'")
-        saved_pass = cursor.fetchone()[0]
+        row = cursor.fetchone()
+        saved_pass = row[0] if row else "123"
         conn.close()
 
         entered_pass, ok = QInputDialog.getText(
@@ -470,9 +598,12 @@ class StudioAccountingApp(QMainWindow):
             ("مدیریت هزینه‌ها\n🔒 (قبوض و...) ", 3, "#c0392b"),
             ("گزارش مالی جامع\n(نمودارها)", 4, "#d35400"),
             ("جستجوی پیشرفته\n(کلی)", 5, "#16a085"),
-            ("انبار / کارت‌ها / چک‌ها\n(امکانات)", 6, "#2c3e50"),
-            ("رسید وجه / سال کاری\n(خدمات)", 7, "#7f8c8d"),
-            ("درباره برنامه\n(توسعه‌دهنده)", 8, "#34495e")
+            ("انبار تجهیزات\n(تجهیزات)", 6, "#2c3e50"),
+            ("کارت‌های بانکی\n(بانک‌ها)", 7, "#1abc9c"),
+            ("مدیریت چک‌ها\n(چک‌ها)", 8, "#e67e22"),
+            ("رسید وجه\n(خدمات)", 9, "#7f8c8d"),
+            ("سال کاری\n(بستن حساب)", 10, "#95a5a6"),
+            ("درباره برنامه\n(توسعه‌دهنده)", 11, "#34495e")
         ]
 
         for text, idx, color in buttons:
@@ -487,8 +618,9 @@ class StudioAccountingApp(QMainWindow):
         self.dashboard_screen.setLayout(layout)
 
     def open_tab_index(self, index):
-        self.tabs.setCurrentIndex(index)
-        self.stack.setCurrentWidget(self.main_app_screen)
+        if hasattr(self, 'tabs'):
+            self.tabs.setCurrentIndex(index)
+            self.stack.setCurrentWidget(self.main_app_screen)
 
     def setup_main_app_ui(self):
         main_layout = QVBoxLayout()
@@ -498,7 +630,7 @@ class StudioAccountingApp(QMainWindow):
         btn_dash.setStyleSheet("background-color: #34495e; color: white; font-weight: bold; padding: 6px;")
         btn_dash.clicked.connect(lambda: self.stack.setCurrentWidget(self.dashboard_screen))
 
-        btn_backup = QPushButton("پشتیبان‌‌گیری (Backup)")
+        btn_backup = QPushButton("پشتیبان‌گیری (Backup)")
         btn_backup.clicked.connect(self.backup_db)
         btn_restore = QPushButton("بازیابی بک‌آپ (Restore)")
         btn_restore.clicked.connect(self.restore_db)
@@ -631,6 +763,8 @@ class StudioAccountingApp(QMainWindow):
         self.w_desc.setPlaceholderText("توضیحات کامل قرارداد...")
         form_layout.addRow("توضیحات قرارداد:", self.w_desc)
 
+        self.item_checkboxes = {}
+        self.item_price_inputs = {}
         self.load_item_checkboxes()
 
         self.btn_save_wedding = QPushButton("ثبت نهایی قرارداد")
@@ -666,9 +800,10 @@ class StudioAccountingApp(QMainWindow):
         self.load_item_checkboxes()
 
     def load_item_checkboxes(self):
-        for i in reversed(range(self.items_vbox.count())): 
+        for i in reversed(range(self.items_vbox.count())):
             widget = self.items_vbox.itemAt(i).widget()
-            if widget: widget.setParent(None)
+            if widget:
+                widget.setParent(None)
 
         self.item_checkboxes = {}
         self.item_price_inputs = {}
@@ -705,16 +840,19 @@ class StudioAccountingApp(QMainWindow):
 
     def on_discount_changed(self, text):
         formatted = format_number(text)
-        if formatted != text: self.w_discount.setText(formatted)
+        if formatted != text:
+            self.w_discount.setText(formatted)
         self.calc_wedding_total()
 
     def on_deposit_changed(self, text):
         formatted = format_number(text)
-        if formatted != text: self.w_first_deposit.setText(formatted)
+        if formatted != text:
+            self.w_first_deposit.setText(formatted)
         self.calc_wedding_total()
 
     def calc_wedding_total(self):
-        if not hasattr(self, 'w_discount') or not hasattr(self, 'w_first_deposit'): return
+        if not hasattr(self, 'w_discount') or not hasattr(self, 'w_first_deposit'):
+            return
 
         selected_sum = 0
         for item_name, cb in self.item_checkboxes.items():
@@ -817,7 +955,8 @@ class StudioAccountingApp(QMainWindow):
             self.w_table.setItem(r_idx, 8, QTableWidgetItem(f"{remain:,}"))
 
             item_settled = QTableWidgetItem("✅ تسویه کامل" if settled else "⏳ در جریان")
-            if settled: item_settled.setForeground(QColor("green"))
+            if settled:
+                item_settled.setForeground(QColor("green"))
             self.w_table.setItem(r_idx, 9, item_settled)
 
             btn_dep = QPushButton("بیعانه‌ها")
@@ -844,7 +983,8 @@ class StudioAccountingApp(QMainWindow):
         self.w_table.resizeRowsToContents()
 
     def delete_wedding_contract(self, contract_id):
-        if not ask_security_password(self): return
+        if not ask_security_password(self):
+            return
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("DELETE FROM wedding_contracts WHERE id=?", (contract_id,))
@@ -871,7 +1011,8 @@ class StudioAccountingApp(QMainWindow):
         c = cursor.fetchone()
         conn.close()
 
-        if not c: return "", ""
+        if not c:
+            return "", ""
 
         filename_default = f"فاکتور_{c[0]}_{c[1]}_{c[4].replace('/', '-')}.pdf"
         items_list = c[6].split(',') if c[6] else []
@@ -932,10 +1073,12 @@ class StudioAccountingApp(QMainWindow):
 
     def export_wedding_pdf(self, contract_id):
         html_content, filename_default = self.generate_pdf_html(contract_id)
-        if not html_content: return
+        if not html_content:
+            return
 
         file_path, _ = QFileDialog.getSaveFileName(self, "ذخیره فاکتور PDF", filename_default, "PDF Files (*.pdf)")
-        if not file_path: return
+        if not file_path:
+            return
 
         doc = QTextDocument()
         doc.setHtml(html_content)
@@ -948,7 +1091,8 @@ class StudioAccountingApp(QMainWindow):
 
     def direct_print_wedding(self, contract_id):
         html_content, _ = self.generate_pdf_html(contract_id)
-        if not html_content: return
+        if not html_content:
+            return
 
         doc = QTextDocument()
         doc.setHtml(html_content)
@@ -1043,7 +1187,8 @@ class StudioAccountingApp(QMainWindow):
             self.c_table.setCellWidget(r_idx, 8, btn_del)
 
     def delete_commercial_project(self, p_id):
-        if not ask_security_password(self): return
+        if not ask_security_password(self):
+            return
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("DELETE FROM commercial_projects WHERE id=?", (p_id,))
@@ -1173,7 +1318,8 @@ class StudioAccountingApp(QMainWindow):
             self.staff_table.setCellWidget(r_idx, 5, btn_del)
 
     def delete_staff_trans(self, tid):
-        if not ask_security_password(self): return
+        if not ask_security_password(self):
+            return
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("DELETE FROM transactions WHERE id=?", (tid,))
@@ -1261,7 +1407,8 @@ class StudioAccountingApp(QMainWindow):
             self.exp_table.setCellWidget(r_idx, 6, btn_del)
 
     def delete_expense(self, eid):
-        if not ask_security_password(self): return
+        if not ask_security_password(self):
+            return
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("DELETE FROM expenses WHERE id=?", (eid,))
@@ -1336,7 +1483,7 @@ class StudioAccountingApp(QMainWindow):
         ]
         for idx, rec in enumerate(records):
             self.rep_table.insertRow(idx)
-            self.rep_table.setItem(idx, 0, QTableWidgetItem(str(idx+1)))
+            self.rep_table.setItem(idx, 0, QTableWidgetItem(str(idx + 1)))
             self.rep_table.setItem(idx, 1, QTableWidgetItem(rec[0]))
             self.rep_table.setItem(idx, 2, QTableWidgetItem(rec[1]))
             self.rep_table.setItem(idx, 3, QTableWidgetItem(f"{rec[2]:,}"))
@@ -1474,7 +1621,8 @@ class StudioAccountingApp(QMainWindow):
         self.load_bank_cards()
 
     def save_bank_card(self):
-        if not self.b_name.text().strip(): return
+        if not self.b_name.text().strip():
+            return
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("INSERT INTO bank_cards (bank_name, card_number, sheba_number) VALUES (?, ?, ?)",
@@ -1567,7 +1715,7 @@ class StudioAccountingApp(QMainWindow):
             self.chk_table.setItem(r_idx, 3, QTableWidgetItem(f"{amount:,}"))
             self.chk_table.setItem(r_idx, 4, QTableWidgetItem(due))
 
-            btn_pass = QPushButton("✅ پاس شده" if is_passed else "⏳ مانده (پاس‌‌کردن)")
+            btn_pass = QPushButton("✅ پاس شده" if is_passed else "⏳ مانده (پاس‌کردن)")
             btn_pass.setStyleSheet("background-color: green; color: white;" if is_passed else "background-color: orange; color: white;")
             btn_pass.clicked.connect(lambda _, cid=c_id, state=is_passed: self.toggle_check_pass(cid, state))
             self.chk_table.setCellWidget(r_idx, 5, btn_pass)
@@ -1586,7 +1734,8 @@ class StudioAccountingApp(QMainWindow):
         self.load_checks_table()
 
     def delete_check(self, cid):
-        if not ask_security_password(self): return
+        if not ask_security_password(self):
+            return
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("DELETE FROM checks WHERE id=?", (cid,))
@@ -1635,7 +1784,7 @@ class StudioAccountingApp(QMainWindow):
             <h3 style="text-align: center; margin-top: 0;">رسید دریافتی وجه / بیعانه</h3>
             <hr>
             <p style="font-size: 14pt; line-height: 2;">
-                بدین‌‌وسیله گواهی می‌شود مبلغ <b>{amount:,} تومان</b> 
+                بدین‌وسیله گواهی می‌شود مبلغ <b>{amount:,} تومان</b> 
                 از جناب آقای / سرکار خانم <b>{name}</b> 
                 بابت <b>{self.rc_for.text()}</b> در تاریخ <b>{self.rc_date.text()}</b> دریافت گردید.
             </p>
@@ -1678,7 +1827,8 @@ class StudioAccountingApp(QMainWindow):
         self.tab_workyear.setLayout(layout)
 
     def close_work_year(self):
-        if not ask_security_password(self): return
+        if not ask_security_password(self):
+            return
 
         reply = QMessageBox.question(self, "تایید نهایی", "آیا مطمئن هستید که می‌خواهید سال کاری را ببندید؟ از دیتابیس فعلی بک‌آپ گرفته خواهد شد.", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
@@ -1741,14 +1891,16 @@ class StudioAccountingApp(QMainWindow):
             QMessageBox.information(self, "موفقیت", "پشتیبان‌گیری با موفقیت انجام شد.")
 
     def restore_db(self):
-        if not ask_security_password(self): return
+        if not ask_security_password(self):
+            return
         file_path, _ = QFileDialog.getOpenFileName(self, "انتخاب فایل پشتیبان", "", "Database Files (*.db)")
         if file_path:
             shutil.copy(file_path, DB_NAME)
             QMessageBox.information(self, "موفقیت", "پایگاه داده با موفقیت بازیابی شد. برنامه را دوباره اجرا کنید.")
 
     def change_password(self):
-        if not ask_security_password(self): return
+        if not ask_security_password(self):
+            return
         new_pass, ok = QInputDialog.getText(self, "تغییر رمز عبور", "رمز عبور جدید را وارد کنید:", QLineEdit.EchoMode.Password)
         if ok and new_pass.strip():
             conn = sqlite3.connect(DB_NAME)
@@ -1758,16 +1910,67 @@ class StudioAccountingApp(QMainWindow):
             conn.close()
             QMessageBox.information(self, "موفقیت", "رمز عبور جدید با موفقیت ثبت گردید.")
 
+
 # --- نقطه‌ی ورود و اجرای برنامه ---
 if __name__ == '__main__':
-    init_db()
     app = QApplication(sys.argv)
-    
+
+    # ⚠️ تشخیص فونت باید بعد از ساخت QApplication انجام شود
+    APP_FONT_FAMILY = setup_fonts()
+    app.setFont(QFont(APP_FONT_FAMILY, 10))
+
+    # ─── نمایش پنجره بارگذاری ───
+    loading = LoadingScreen()
+    loading.show()
+
+    # لیست مراحل بارگذاری (متن، درصد)
+    steps = [
+        ("راه‌اندازی موتور برنامه...", 5),
+        ("بارگذاری فونت‌های فارسی...", 12),
+        ("اتصال به پایگاه داده SQLite...", 22),
+        ("ایجاد جداول در صورت نیاز...", 35),
+        ("بارگذاری تنظیمات امنیتی...", 45),
+        ("آماده‌سازی رابط کاربری...", 58),
+        ("بارگذاری تب‌های برنامه...", 72),
+        ("بارگذاری قراردادها و پروژه‌ها...", 85),
+        ("بارگذاری انبار و کارت‌های بانکی...", 93),
+        ("آماده‌سازی نهایی...", 98),
+        ("ورود به سیستم...", 100),
+    ]
+
+    # پنجره اصلی برنامه (هنوز نمایش داده نمی‌شود)
     main_win = StudioAccountingApp()
-    if main_win.prompt_login():
-        main_win.setup_dashboard_ui()
-        main_win.setup_main_app_ui()
-        main_win.show()
-        sys.exit(app.exec())
-    else:
-        sys.exit(0)
+
+    # اجرای پله‌ای مراحل با QTimer
+    current_step = {"index": 0}
+
+    def finish_loading():
+        loading.close()
+        if main_win.prompt_login():
+            main_win.stack.setCurrentWidget(main_win.dashboard_screen)
+            main_win.show()
+        else:
+            app.quit()
+
+    def run_step():
+        if current_step["index"] < len(steps):
+            text, percent = steps[current_step["index"]]
+            loading.set_progress(percent, text)
+
+            # عملیات واقعی هر مرحله
+            if current_step["index"] == 2:
+                init_db()
+            elif current_step["index"] == 5:
+                main_win.setup_dashboard_ui()
+            elif current_step["index"] == 6:
+                main_win.setup_main_app_ui()
+
+            current_step["index"] += 1
+            QTimer.singleShot(300, run_step)
+        else:
+            QTimer.singleShot(400, finish_loading)
+
+    # شروع اجرای مراحل
+    QTimer.singleShot(400, run_step)
+
+    sys.exit(app.exec())
