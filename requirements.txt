@@ -1,6 +1,15 @@
-PyQt6
-jdatetime
-openpyxl
-matplotlib
-pyinstaller
-reportlab
+# نیازمندی‌های نرم‌افزار IMART STUDIO - نسخه ۱۰
+# نصب:  pip install -r requirements.txt
+
+PyQt6>=6.5
+jdatetime>=4.1
+matplotlib>=3.7
+openpyxl>=3.1
+reportlab>=4.0
+pyinstaller>=6.0
+
+# --- اختیاری (کیفیت بهتر متن فارسی در نمودارها) ---
+# این دو پکیج اختیاری هستند؛ برنامه بدون آن‌ها هم کار می‌کند چون
+# موتور شکل‌دهی فارسی به‌صورت داخلی در خود برنامه پیاده‌سازی شده است.
+# arabic-reshaper>=3.0
+# python-bidi>=0.4
