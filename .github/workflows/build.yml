@@ -1,20 +1,37 @@
 name: Build Windows EXE
 
+# ============================================================
+#  نکته: خطای «Node.js 20 is deprecated» فقط یک هشدار است و
+#  بیلد را قرمز نمی‌کند. علت اصلی در استپ دیگری است.
+#  این نسخه، سه مشکل رایج را برطرف می‌کند:
+#    ۱) اکشن‌های Node 20 به نسخه‌های Node 24 ارتقا یافتند
+#    ۲) استپ آیکون در برابر PNG های palette / CMYK مقاوم شد
+#       (خطای رایج: cannot write mode P as ICO)
+#    ۳) اگر Accounting.png در مخزن نباشد، خودکار ساخته می‌شود
+# ============================================================
+
 on:
   push:
     branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+    # Node 24 (بدون هشدار) — قبلاً actions/checkout@v4 بود
+    - uses: actions/checkout@v5
 
+    # Node 24 — قبلاً actions/setup-python@v5 بود
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: '3.10'
+        cache: 'pip'
+
+    - name: Show repository files
+      run: Get-ChildItem -Force | Select-Object Name, Length
 
     - name: Install dependencies
       run: |
@@ -22,16 +39,75 @@ jobs:
         pip install -r requirements.txt
         pip install pillow
 
-    - name: Convert PNG Icon to ICO
+    # ------------------------------------------------------------
+    #  ساخت آیکون
+    #  ۱) اگر Accounting.png نباشد، یک آیکون پیش‌فرض ساخته می‌شود
+    #  ۲) تصویر به RGBA تبدیل و به ۲۵۶x۲۵۶ تغییر اندازه داده می‌شود
+    #     (PNG های palette باعث خطای «cannot write mode P as ICO» می‌شوند)
+    # ------------------------------------------------------------
+    - name: Prepare icon (robust)
+      shell: pwsh
       run: |
-        python -c "from PIL import Image; img = Image.open('Accounting.png'); img.save('app_icon.ico', format='ICO', sizes=[(256, 256)])"
+        if (-not (Test-Path "Accounting.png")) {
+          Write-Host "Accounting.png not found -> creating a default icon."
+          python -c "import sys; from PyQt6.QtWidgets import QApplication; from PyQt6.QtGui import QImage, QColor; a=QApplication(sys.argv); img=QImage(256,256,QImage.Format.Format_ARGB32); img.fill(QColor('#1F4E78')); img.save('Accounting.png')"
+        }
 
+        # بدون ارجاع به ثابت‌های resample (در نسخه‌های مختلف Pillow تغییر کرده‌اند)
+        python -c "from PIL import Image; img = Image.open('Accounting.png').convert('RGBA'); img = img.resize((256, 256)); img.save('app_icon.ico', format='ICO', sizes=[(256, 256)])"
+
+        if (-not (Test-Path "app_icon.ico")) {
+          Write-Error "app_icon.ico was not created."
+          exit 1
+        }
+        Write-Host "Icon is ready."
+
+    # ------------------------------------------------------------
+    #  بررسی وجود فایل برنامه (پیام خطای واضح به‌جای خطای مبهم)
+    # ------------------------------------------------------------
+    - name: Check application file
+      shell: pwsh
+      run: |
+        $candidates = @("app.py", "studio_accounting_v11.py", "studio_accounting_v10.py", "main.py")
+        $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+        if (-not $found) {
+          Write-Error "No application file found. Candidates: $($candidates -join ', ')"
+          exit 1
+        }
+        "APP_FILE=$found" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        Write-Host "Application file: $found"
+
+    # ------------------------------------------------------------
+    #  ساخت EXE
+    #  --onefile : یک فایل مستقل
+    #  --windowed: بدون پنجره کنسول
+    # ------------------------------------------------------------
     - name: Build EXE with PyInstaller
+      shell: cmd
       run: |
-        pyinstaller --noconfirm --onefile --windowed --icon=app_icon.ico --add-data "Accounting.png;." app.py
+        pyinstaller --noconfirm --clean --onefile --windowed --icon=app_icon.ico --add-data "Accounting.png;." --hidden-import PyQt6.QtPrintSupport --hidden-import matplotlib.backends.backend_qtagg --hidden-import openpyxl --exclude-module tkinter --exclude-module PyQt5 --exclude-module PySide6 "%APP_FILE%"
 
+    - name: Verify output
+      shell: pwsh
+      run: |
+        if (-not (Test-Path "dist")) {
+          Write-Error "The dist folder does not exist."
+          exit 1
+        }
+        Get-ChildItem -Recurse "dist" | Select-Object FullName, Length
+        $exe = Get-ChildItem "dist" -Filter *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $exe) {
+          Write-Error "No .exe was produced."
+          exit 1
+        }
+        "EXE_PATH=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+        Write-Host "EXE built: $($exe.FullName)"
+
+    # Node 24 — قبلاً actions/upload-artifact@v4 بود
     - name: Upload Windows EXE
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
-        name: Studio_Accounting_v4_Windows
-        path: dist/app.exe
+        name: Studio_Accounting_v11_Windows
+        path: dist/*.exe
+        if-no-files-found: error
+        retention-days: 30

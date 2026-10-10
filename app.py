@@ -20,12 +20,25 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import (Qt, QDate, QTimer, QSizeF, QRectF, QPointF, QSize, QRect,
                           pyqtSignal, QMarginsF, QByteArray, QPropertyAnimation, QEasingCurve)
 from PyQt6.QtGui import (
-    QFont, QIcon, QColor, QFontDatabase, QTextDocument, QPixmap, QPainter,
+    QFont, QIcon, QColor, QFontDatabase, QTextDocument, QPixmap, QPainter, QImage,
     QLinearGradient, QBrush, QPageSize, QPageLayout, QAction, QTextOption,
     QFontMetrics, QIntValidator, QPalette, QPen, QDesktopServices
 )
 from PyQt6.QtCore import QUrl
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog, QPrinterInfo
+
+# ---------------------------------------------------------------
+# مسیر کش فونت matplotlib را کنار خود برنامه تنظیم می‌کنیم.
+# در حالت EXE تک‌فایلی (--onefile) پوشه موقت هر بار عوض می‌شود و
+# matplotlib مجبور است هر اجرا کش فونت را از نو بسازد (چند ثانیه تأخیر).
+# با این تنظیم، کش یک‌بار ساخته و دفعات بعد سریع اجرا می‌شود.
+# ---------------------------------------------------------------
+try:
+    _app_base = os.path.dirname(os.path.abspath(
+        sys.executable if getattr(sys, "frozen", False) else __file__))
+    os.environ.setdefault("MPLCONFIGDIR", os.path.join(_app_base, "mpl_cache"))
+except Exception:
+    pass
 
 import matplotlib
 matplotlib.use('QtAgg')
@@ -1370,6 +1383,65 @@ def persist_splitter(splitter, key):
 
 # ---------------------------------------------------------------
 # ۶-۶) ویجت‌های کمکی نسخه ۱۱
+# ---------------------------------------------------------------
+class ElidedCheckBox(QCheckBox):
+    """
+    چک‌باکسی که به‌جای ایجاد اسکرول افقی، متنش کوتاه (…) می‌شود
+    تا هر تعداد آیتم در عرض موجود جا شود.
+    """
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._full_text = text
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(60)
+
+    def setFullText(self, text):
+        self._full_text = text
+        self.setToolTip(text)
+        self._apply_elide()
+
+    def fullText(self):
+        return self._full_text
+
+    def _apply_elide(self):
+        try:
+            fm = QFontMetrics(self.font())
+            avail = max(40, self.width() - 26)
+            elided = fm.elidedText(self._full_text, Qt.TextElideMode.ElideLeft, avail)
+            if super().text() != elided:
+                super().setText(elided)
+        except Exception:
+            pass
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._apply_elide()
+
+
+class HoverTileButton(QPushButton):
+    """دکمه کارت داشبورد با رویداد ورود/خروج موس برای انیمیشن"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.on_enter = None
+        self.on_leave = None
+
+    def enterEvent(self, event):
+        try:
+            if self.on_enter:
+                self.on_enter()
+        finally:
+            super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        try:
+            if self.on_leave:
+                self.on_leave()
+        finally:
+            super().leaveEvent(event)
+
+
 def days_left_short(date_str):
     d = parse_jalali(date_str)
     if d is None:
@@ -1382,7 +1454,7 @@ def days_left_short(date_str):
         return f"⏳ {left} روز مانده"
     if left == 0:
         return "🎉 امروز"
-    return f"✅ برگزار شده"
+    return "✅ برگزار شده"
 
 
 def settlement_state(net, paid):
@@ -4120,7 +4192,7 @@ class InvoiceBuilder:
     @staticmethod
     def _td(text, align="center", size="7.5pt", bg=None, color=None, bold=False,
             colspan=None, width=None):
-        st = [f"border:1px solid #8a8a8a", f"padding:3px 4px",
+        st = ["border:1px solid #8a8a8a", "padding:3px 4px",
               f"text-align:{align}", f"font-size:{size}"]
         if bg:
             st.append(f"background-color:{bg}")
@@ -4176,7 +4248,6 @@ class InvoiceBuilder:
     def _title_band(p, right_title, right_sub, left_lines):
         """سربرگ رنگی/خاکستری سند"""
         left = "".join(f"<div>{ln}</div>" for ln in left_lines if ln)
-        right = ""
         return (
             f"<table width='100%' style='border-collapse:collapse;'>"
             f"<tr style='background-color:{p['head_bg']};'>"
