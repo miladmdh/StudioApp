@@ -1,5 +1,6 @@
 import sys
 import os
+import re
 import json
 import shutil
 import sqlite3
@@ -14,9 +15,10 @@ from PyQt6.QtWidgets import (
     QTextEdit, QScrollArea, QTreeWidget, QTreeWidgetItem, QDateEdit,
     QProgressBar, QGraphicsDropShadowEffect, QListWidget, QListWidgetItem,
     QGridLayout, QMenu, QToolButton, QSizePolicy, QAbstractItemView,
-    QDialogButtonBox, QRadioButton, QButtonGroup
+    QDialogButtonBox, QRadioButton, QButtonGroup, QSplitter
 )
-from PyQt6.QtCore import Qt, QDate, QTimer, QSizeF, QRectF, QPointF, QSize, pyqtSignal, QMarginsF
+from PyQt6.QtCore import (Qt, QDate, QTimer, QSizeF, QRectF, QPointF, QSize, QRect,
+                          pyqtSignal, QMarginsF, QByteArray, QPropertyAnimation, QEasingCurve)
 from PyQt6.QtGui import (
     QFont, QIcon, QColor, QFontDatabase, QTextDocument, QPixmap, QPainter,
     QLinearGradient, QBrush, QPageSize, QPageLayout, QAction, QTextOption,
@@ -35,7 +37,7 @@ from matplotlib.figure import Figure
 # تنظیم ID جهت آیکون ویندوز
 try:
     import ctypes
-    myappid = 'imartstudio.accounting.v10.0'
+    myappid = 'imartstudio.accounting.v11.0'
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 except Exception:
     pass
@@ -58,7 +60,7 @@ def get_app_dir():
 
 APP_DIR = get_app_dir()
 DB_NAME = os.path.join(APP_DIR, "studio_accounting.db")
-APP_VERSION = "10.0"
+APP_VERSION = "11.0"
 DEVELOPER_NAME = "میلاد محمدحسینی"
 
 # ⚠️ مقدار پیش‌فرض فونت (بعد از ساخت QApplication نهایی می‌شود)
@@ -800,19 +802,24 @@ def render_document_to_printer(doc, printer):
                 errors.append(f"{name}: {e}")
     # آخرین راه‌حل: رندر دستی چندصفحه‌ای با QPainter
     try:
-        page_rect = printer.pageRect(QPrinter.Unit.DevicePixel)
-        doc.setPageSize(QSizeF(page_rect.width(), page_rect.height()))
+        page_pt = printer.pageRect(QPrinter.Unit.Point)
+        page_px = printer.pageRect(QPrinter.Unit.DevicePixel)
+        doc.setPageSize(QSizeF(page_pt.width(), page_pt.height()))
         painter = QPainter(printer)
         if not painter.isActive():
             errors.append("painter not active")
             print("[PRINT] all methods failed:", errors)
             return False
+        # تبدیل واحد سند (point) به پیکسل دستگاه
+        sx = page_px.width() / max(1.0, float(page_pt.width()))
+        sy = page_px.height() / max(1.0, float(page_pt.height()))
+        painter.scale(sx, sy)
         count = max(1, doc.pageCount())
         for page in range(count):
             if page:
                 printer.newPage()
             painter.save()
-            painter.translate(0, -page * page_rect.height())
+            painter.translate(0, -page * page_pt.height())
             doc.drawContents(painter)
             painter.restore()
         painter.end()
@@ -823,12 +830,20 @@ def render_document_to_printer(doc, printer):
         return False
 
 
-def _make_printer(output_format=None, file_path=None, doc_name="سند"):
+def _make_printer(output_format=None, file_path=None, doc_name="سند",
+                  page_size=None, margins_mm=7):
+    """
+    ساخت پرینتر — پیش‌فرض همه اسناد نسخه ۱۱ روی کاغذ A5 تنظیم شده است.
+    """
     printer = QPrinter(QPrinter.PrinterMode.HighResolution)
     printer.setDocName(doc_name)
-    printer.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
     try:
-        printer.setPageMargins(QMarginsF(12, 12, 12, 12), QPageLayout.Unit.Millimeter)
+        printer.setPageSize(QPageSize(page_size or QPageSize.PageSizeId.A5))
+    except Exception:
+        pass
+    try:
+        printer.setPageMargins(QMarginsF(margins_mm, margins_mm, margins_mm, margins_mm),
+                               QPageLayout.Unit.Millimeter)
     except Exception:
         pass
     if output_format is not None:
@@ -838,15 +853,15 @@ def _make_printer(output_format=None, file_path=None, doc_name="سند"):
     return printer
 
 
-def print_html_document(html, parent=None, doc_name="چاپ سند"):
-    """چاپ واقعی سند با دیالوگ پرینتر ویندوز"""
+def print_html_document(html, parent=None, doc_name="چاپ سند", page_size=None):
+    """چاپ واقعی سند روی یک برگ A5 با دیالوگ پرینتر ویندوز"""
     try:
-        printer = _make_printer(doc_name=doc_name)
+        printer = _make_printer(doc_name=doc_name, page_size=page_size)
         dialog = QPrintDialog(printer, parent)
         dialog.setWindowTitle(f"چاپ {doc_name}")
         if dialog.exec() != QPrintDialog.DialogCode.Accepted:
             return False
-        doc = build_print_document(html)
+        doc = fit_document_to_page(html, printer)
         ok = render_document_to_printer(doc, printer)
         if not ok:
             QMessageBox.critical(parent, "خطای چاپ",
@@ -857,11 +872,11 @@ def print_html_document(html, parent=None, doc_name="چاپ سند"):
         return False
 
 
-def save_html_pdf(html, file_path, doc_name="سند"):
-    """ذخیره PDF فارسی با فونت صحیح (بدون به‌هم‌ریختگی حروف)"""
+def save_html_pdf(html, file_path, doc_name="سند", page_size=None):
+    """ذخیره PDF فارسی رنگی روی یک برگ A5 با فونت صحیح"""
     try:
-        printer = _make_printer(QPrinter.OutputFormat.PdfFormat, file_path, doc_name)
-        doc = build_print_document(html)
+        printer = _make_printer(QPrinter.OutputFormat.PdfFormat, file_path, doc_name, page_size)
+        doc = fit_document_to_page(html, printer)
         ok = render_document_to_printer(doc, printer)
         if not ok:
             return False, "رندر سند روی PDF ناموفق بود."
@@ -1112,8 +1127,274 @@ def fa_shape(text):
         return get_display(arabic_reshaper.reshape(s))
     except Exception:
         pass
-    return _reorder_rtl(_shape_logical(s))
+    # آینه‌کردن پرانتزها تا «()» به‌جای «)(» دیده شود
+    return _mirror_brackets(_reorder_rtl(_shape_logical(s)))
 
+
+# ---------------------------------------------------------------
+# ۶-۲) آینه‌کردن پرانتزها (رفع «)(» به‌جای «()» در نمودارها)
+# ---------------------------------------------------------------
+_BIDI_MIRROR = {
+    "(": ")", ")": "(",
+    "[": "]", "]": "[",
+    "{": "}", "}": "{",
+    "<": ">", ">": "<",
+    "«": "»", "»": "«",
+}
+
+
+def _mirror_brackets(text):
+    """جای پرانتزها را در متن راست‌چین‌شده اصلاح می‌کند"""
+    return "".join(_BIDI_MIRROR.get(c, c) for c in text)
+
+
+# ---------------------------------------------------------------
+# ۶-۳) پالت رنگ اسناد: حالت رنگی (PDF) و حالت سیاه و سفید (پرینت)
+# ---------------------------------------------------------------
+def doc_palette(mono=False):
+    """
+    mono=False → رنگ‌های زیبا برای PDF و نمایش روی صفحه
+    mono=True  → رنگ‌های خاکستری/سیاه‌وسفید مناسب چاپگر لیزری و چاپ سیاه‌وسفید
+    """
+    if mono:
+        return {
+            "head_bg": "#2b2b2b", "head_fg": "#ffffff",
+            "table_head": "#5a5a5a", "table_head_fg": "#ffffff",
+            "alt_row": "#f0f0f0", "box_bg": "#e6e6e6",
+            "border": "#8a8a8a", "accent": "#1a1a1a",
+            "warn_bg": "#ededed", "warn_border": "#6b6b6b",
+            "recv_head": "#4a4a4a", "paid_head": "#7d7d7d",
+            "staff_head": "#6a6a6a", "ok": "#1a1a1a", "bad": "#1a1a1a",
+            "info_bg": "#f5f5f5", "total_bg": "#dcdcdc", "muted": "#5a5a5a",
+        }
+    return {
+        "head_bg": "#1F4E78", "head_fg": "#ffffff",
+        "table_head": "#2C6699", "table_head_fg": "#ffffff",
+        "alt_row": "#f4f8fd", "box_bg": "#eef5fc",
+        "border": "#9bb0c4", "accent": "#1F4E78",
+        "warn_bg": "#fdedec", "warn_border": "#e74c3c",
+        "recv_head": "#1e8449", "paid_head": "#a93226",
+        "staff_head": "#5b2c8e", "ok": "#1e8449", "bad": "#c0392b",
+        "info_bg": "#eaf6ff", "total_bg": "#ffe9a8", "muted": "#7f8c8d",
+    }
+
+
+# ---------------------------------------------------------------
+# ۶-۴) کوچک‌سازی هوشمند سند تا در یک برگ A5 جا شود
+# ---------------------------------------------------------------
+def scale_html(html, factor):
+    """همه اندازه‌های فونت و فاصله‌های سند را با یک ضریب کوچک/بزرگ می‌کند"""
+    if abs(factor - 1.0) < 0.001:
+        return html
+
+    def pad_repl(m):
+        vals = [v for v in m.group(1).split() if v.endswith("px")]
+        return "padding:" + " ".join(f"{float(v[:-2]) * factor:.1f}px" for v in vals)
+
+    out = re.sub(r"padding\s*:\s*((?:[\d.]+px\s*)+)", pad_repl, html)
+    out = re.sub(r"font-size\s*:\s*([\d.]+)pt",
+                 lambda m: f"font-size:{float(m.group(1)) * factor:.2f}pt", out)
+    out = re.sub(r"margin-top\s*:\s*([\d.]+)px",
+                 lambda m: f"margin-top:{float(m.group(1)) * factor:.1f}px", out)
+    out = re.sub(r"margin-bottom\s*:\s*([\d.]+)px",
+                 lambda m: f"margin-bottom:{float(m.group(1)) * factor:.1f}px", out)
+    return out
+
+
+def fit_document_to_page(html, printer, min_scale=0.45, max_scale=1.25, step=0.05):
+    """
+    سند را با «بزرگ‌ترین فونت ممکن» می‌سازد که در یک برگ جا شود،
+    بدون آنکه متن‌ها بشکنند و به‌هم بریزند.
+    از بزرگ‌ترین مقیاس شروع می‌کند و اولین مقیاسی که در یک صفحه جا شود
+    برگردانده می‌شود؛ اگر هیچ‌کدام جا نشد، کوچک‌ترین حالت برمی‌گردد.
+    """
+    # اندازه صفحه باید هم‌واحد با اندازه فونت (point) باشد؛
+    # در غیر این صورت شمارش صفحه‌ها درست انجام نمی‌شود.
+    try:
+        page = printer.pageRect(QPrinter.Unit.Point)
+        size = QSizeF(page.width(), page.height())
+    except Exception:
+        size = QSizeF(420, 595)
+
+    scale = max_scale
+    last = None
+    while scale >= min_scale - 1e-6:
+        try:
+            doc = build_print_document(scale_html(html, scale))
+            doc.setPageSize(size)
+            last = doc
+            if doc.pageCount() <= 1:
+                return doc
+        except Exception as e:
+            print("[FIT] scale", round(scale, 2), "failed:", e)
+        scale -= step
+    return last
+
+
+# ---------------------------------------------------------------
+# ۶-۵) ذخیره و بازیابی ابعاد پنجره‌ها، جدول‌ها و اسپلیترها
+# ---------------------------------------------------------------
+def save_geometry(key, widget):
+    """ابعاد و مکان فعلی پنجره را ذخیره می‌کند"""
+    try:
+        set_setting(f"geom_{key}",
+                    bytes(widget.saveGeometry().toBase64()).decode("ascii"))
+        set_setting(f"size_{key}", f"{widget.width()}x{widget.height()}")
+    except Exception as e:
+        print(f"[GEOM] save {key} failed:", e)
+
+
+def restore_geometry(key, widget):
+    """
+    ابعاد و مکان ذخیره‌شده را برمی‌گرداند.
+    اندازه ذخیره‌شده صریحاً هم اعمال می‌شود تا در همه سیستم‌عامل‌ها یکسان کار کند،
+    فقط اگر بزرگ‌تر از صفحه‌نمایش باشد تا اندازه صفحه محدود می‌شود.
+    """
+    restored = False
+    try:
+        data = get_setting(f"geom_{key}", "")
+        if data:
+            restored = widget.restoreGeometry(QByteArray.fromBase64(data.encode("ascii")))
+    except Exception as e:
+        print(f"[GEOM] restore {key} failed:", e)
+
+    try:
+        size = get_setting(f"size_{key}", "")
+        if size and "x" in size:
+            w, h = (int(v) for v in size.split("x", 1))
+            try:
+                screen = widget.screen() or QApplication.primaryScreen()
+                if screen:
+                    geo = screen.availableGeometry()
+                    w = min(w, geo.width())
+                    h = min(h, geo.height())
+            except Exception:
+                pass
+            w = max(w, widget.minimumWidth())
+            h = max(h, widget.minimumHeight())
+            widget.resize(w, h)
+            restored = True
+    except Exception as e:
+        print(f"[GEOM] size restore {key} failed:", e)
+    return restored
+
+
+def persist_dialog(dialog, key):
+    """ابعاد دیالوگ را ذخیره و در اجرای بعدی همان‌طور بازیابی می‌کند"""
+    restore_geometry(key, dialog)
+    try:
+        dialog.finished.connect(lambda _r: save_geometry(key, dialog))
+    except Exception:
+        pass
+    return dialog
+
+
+def save_table_columns(key, table):
+    try:
+        widths = [table.columnWidth(c) for c in range(table.columnCount())]
+        set_setting(f"cols_{key}", json.dumps(widths))
+    except Exception:
+        pass
+
+
+def restore_table_columns(key, table):
+    try:
+        data = get_setting(f"cols_{key}", "")
+        if not data:
+            return False
+        widths = json.loads(data)
+        for c, w in enumerate(widths[:table.columnCount()]):
+            if w and int(w) > 8:
+                table.setColumnWidth(c, int(w))
+        return True
+    except Exception as e:
+        print(f"[COLS] restore {key} failed:", e)
+        return False
+
+
+def persist_table(table, key, resize_mode=None):
+    """
+    پهنای ستون‌های جدول را ذخیره و در اجرای بعدی همان‌طور بازیابی می‌کند.
+    اگر قبلاً کاربر ستون‌ها را تغییر داده باشد، حالت Interactive (قابل تغییر) می‌ماند.
+    """
+    header = table.horizontalHeader()
+    header.setSectionsMovable(True)
+    header.setStretchLastSection(False)
+
+    if restore_table_columns(key, table):
+        # عرض‌های ذخیره‌شده کاربر برمی‌گردد و ستون‌ها قابل تغییر می‌مانند
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+    elif resize_mode == QHeaderView.ResizeMode.Stretch:
+        # جدول‌های کشسان نیازی به ذخیره عرض ستون ندارند
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        return table
+    else:
+        # اولین اجرا: عرض متناسب با محتوا، ولی «قابل تغییر» تا کاربر بتواند تنظیم کند
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        try:
+            table.resizeColumnsToContents()
+            for c in range(table.columnCount()):
+                if table.columnWidth(c) < 62:
+                    table.setColumnWidth(c, 62)
+                elif table.columnWidth(c) > 420:
+                    table.setColumnWidth(c, 420)
+        except Exception as e:
+            print("[COLS] initial sizing failed:", e)
+
+    header.sectionResized.connect(lambda *_: save_table_columns(key, table))
+    return table
+
+
+def save_splitter(key, splitter):
+    try:
+        set_setting(f"split_{key}", bytes(splitter.saveState().toBase64()).decode("ascii"))
+    except Exception:
+        pass
+
+
+def restore_splitter(key, splitter):
+    try:
+        data = get_setting(f"split_{key}", "")
+        if data:
+            return splitter.restoreState(QByteArray.fromBase64(data.encode("ascii")))
+    except Exception:
+        pass
+    return False
+
+
+def persist_splitter(splitter, key):
+    restore_splitter(key, splitter)
+    splitter.splitterMoved.connect(lambda *_: save_splitter(key, splitter))
+    return splitter
+
+
+# ---------------------------------------------------------------
+# ۶-۶) ویجت‌های کمکی نسخه ۱۱
+def days_left_short(date_str):
+    d = parse_jalali(date_str)
+    if d is None:
+        return "-"
+    try:
+        left = (d - jdatetime.date.today()).days
+    except Exception:
+        return "-"
+    if left > 0:
+        return f"⏳ {left} روز مانده"
+    if left == 0:
+        return "🎉 امروز"
+    return f"✅ برگزار شده"
+
+
+def settlement_state(net, paid):
+    """وضعیت تسویه: کامل / ناقص / نشده"""
+    net = net or 0
+    paid = paid or 0
+    remain = max(0, net - paid)
+    if remain <= 0:
+        return "تسویه کامل", remain
+    if paid <= 0:
+        return "تسویه نشده", remain
+    return "تسویه ناقص", remain
 
 # ---------------------------------------------------------------
 # ۷) ویجت تاریخ شمسی با پرش خودکار روز → ماه → سال
@@ -1604,19 +1885,32 @@ def init_db():
         ("کرین", 6000000, 0, ""), ("هلی شات", 7000000, 0, ""),
         ("عکاس مجلس", 4000000, 0, ""), ("پکیج طلایی VIP", 35000000, 1, "")
     ]
-    srv_n = 1000
-    pkg_n = 2000
-    for idx, (item, price, is_pkg, parent) in enumerate(default_items):
-        if is_pkg:
-            pkg_n += 1
-            code = f"PKG-{pkg_n}"
-        else:
-            srv_n += 1
-            code = f"SRV-{srv_n}"
-        cursor.execute(
-            "INSERT OR IGNORE INTO item_prices (item_name, code, price, is_package, parent_package) VALUES (?, ?, ?, ?, ?)",
-            (item, code, price, is_pkg, parent)
-        )
+    # ⚠️ نسخه ۱۱: اقلام پیش‌فرض فقط در «اولین اجرا» ساخته می‌شوند.
+    # در نسخه ۱۰ هر بار اجرای برنامه این اقلام دوباره درج می‌شدند و
+    # اقلامی که کاربر حذف کرده بود، بعد از بستن و اجرای مجدد برمی‌گشتند.
+    already_seeded = _flag_is_set(cursor, "seeded_defaults_v11")
+    try:
+        cursor.execute("SELECT COUNT(*) FROM item_prices")
+        has_items = cursor.fetchone()[0] > 0
+    except Exception:
+        has_items = False
+
+    if not already_seeded:
+        if not has_items:
+            srv_n = 1000
+            pkg_n = 2000
+            for idx, (item, price, is_pkg, parent) in enumerate(default_items):
+                if is_pkg:
+                    pkg_n += 1
+                    code = f"PKG-{pkg_n}"
+                else:
+                    srv_n += 1
+                    code = f"SRV-{srv_n}"
+                cursor.execute(
+                    "INSERT OR IGNORE INTO item_prices (item_name, code, price, is_package, parent_package) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (item, code, price, is_pkg, parent))
+        _set_flag(cursor, "seeded_defaults_v11")
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS wedding_contracts (
@@ -1647,8 +1941,11 @@ def init_db():
         item_name TEXT PRIMARY KEY, total_count INTEGER DEFAULT 0, used_count INTEGER DEFAULT 0
     )''')
 
-    for item, _, _, _ in default_items:
-        cursor.execute("INSERT OR IGNORE INTO inventory (item_name, total_count, used_count) VALUES (?, 10, 0)", (item,))
+    # موجودی اولیه هم فقط یک‌بار برای اقلام پیش‌فرض ساخته می‌شود
+    if not already_seeded and not has_items:
+        for item, _, _, _ in default_items:
+            cursor.execute("INSERT OR IGNORE INTO inventory (item_name, total_count, used_count) "
+                           "VALUES (?, 10, 0)", (item,))
 
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS checks (
@@ -1668,6 +1965,7 @@ def init_db():
     _add_column_if_missing(cursor, "transactions", "contract_id", "INTEGER")
     _add_column_if_missing(cursor, "checks", "contract_id", "INTEGER")
     _add_column_if_missing(cursor, "inventory", "category", "TEXT DEFAULT ''")
+    _add_column_if_missing(cursor, "wedding_contracts", "venue", "TEXT")
     _add_column_if_missing(cursor, "inventory", "note", "TEXT DEFAULT ''")
 
     # ۰) پر کردن جزئیات قیمت هر قرارداد تا فاکتور دقیقاً همان مبالغ را نشان دهد
@@ -1738,32 +2036,43 @@ def init_db():
 # ============================================================
 class PrintChoiceDialog(QDialog):
     """
-    انتخاب نوع خروجی برای فاکتورها:
-      • چاپ روی چاپگر  یا  ذخیره PDF
+    انتخاب نوع خروجی برای اسناد:
+      • چاپ روی چاپگر (سیاه و سفید، مناسب چاپگر لیزری)  یا  ذخیره PDF رنگی
       • با ریز پکیج (زیرمجموعه‌ها چاپ شوند)  یا  بدون ریز پکیج
+      • با نیروی کار  یا  بدون نیروی کار
+    همه اسناد روی یک برگ A5 چاپ می‌شوند.
     """
 
-    def __init__(self, parent=None, title="چاپ / خروجی PDF", allow_details=True):
+    def __init__(self, parent=None, title="چاپ / خروجی PDF",
+                 allow_details=True, allow_staff=False):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
-        self.setMinimumWidth(430)
+        self.setMinimumWidth(470)
         self.mode = "print"
         self.with_details = True
+        self.with_staff = True
+        persist_dialog(self, "dlg_print_choice")
 
         lay = QVBoxLayout(self)
-        lay.setSpacing(12)
+        lay.setSpacing(9)
 
         head = QLabel(f"{ico('print')}  {title}")
         head.setProperty("heading", True)
         head.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(head)
 
+        size_hint = QLabel(f"{ico('pdf')} همه اسناد روی یک برگ <b>A5</b> چاپ می‌شوند.")
+        size_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        size_hint.setStyleSheet("background-color:#eaf6ff; border:1px solid #a9d3ee; "
+                                "border-radius:8px; padding:6px;")
+        lay.addWidget(size_hint)
+
         box1 = QGroupBox("نوع خروجی")
         v1 = QVBoxLayout()
-        self.rb_print = QRadioButton(f"{ico('print')}  چاپ روی چاپگر")
-        self.rb_pdf = QRadioButton(f"{ico('pdf')}  ذخیره فایل PDF")
+        self.rb_print = QRadioButton(f"{ico('print')}  چاپ روی چاپگر (سیاه و سفید)")
+        self.rb_pdf = QRadioButton(f"{ico('pdf')}  ذخیره فایل PDF (رنگی)")
         self.rb_print.setChecked(True)
         v1.addWidget(self.rb_print)
         v1.addWidget(self.rb_pdf)
@@ -1781,6 +2090,17 @@ class PrintChoiceDialog(QDialog):
             box2.setLayout(v2)
             lay.addWidget(box2)
 
+        if allow_staff:
+            box3 = QGroupBox("نیروی کار")
+            v3 = QVBoxLayout()
+            self.rb_staff_yes = QRadioButton(f"{ico('staff')}  با نیروی کار (چاپ شود)")
+            self.rb_staff_no = QRadioButton(f"{ico('staff')}  بدون نیروی کار (چاپ نشود)")
+            self.rb_staff_yes.setChecked(True)
+            v3.addWidget(self.rb_staff_yes)
+            v3.addWidget(self.rb_staff_no)
+            box3.setLayout(v3)
+            lay.addWidget(box3)
+
         btn_row = QHBoxLayout()
         btn_ok = QPushButton(ico_text("ok", "تایید و ادامه"))
         btn_ok.setStyleSheet("background-color:#27ae60; color:white; font-weight:bold; padding:9px;")
@@ -1795,141 +2115,422 @@ class PrintChoiceDialog(QDialog):
         self.mode = "pdf" if getattr(self, "rb_pdf", None) and self.rb_pdf.isChecked() else "print"
         if hasattr(self, "rb_with"):
             self.with_details = self.rb_with.isChecked()
+        if hasattr(self, "rb_staff_yes"):
+            self.with_staff = self.rb_staff_yes.isChecked()
         self.accept()
 
 
 # ============================================================
-# ============  PackageDetailsDialog (جزئیات پکیج)  ==========
+# ======  PackageDetailsDialog (ویرایشگر کامل زیرمجموعه)  ====
 # ============================================================
 class PackageDetailsDialog(QDialog):
-    """نمایش کامل جزئیات یک پکیج و همه زیرمجموعه‌های آن"""
+    """
+    مدیریت کامل یک پکیج و زیرمجموعه‌هایش:
+      • افزودن آیتم جدید با قیمت
+      • افزودن از کالاها/خدمات موجود
+      • حذف آیتم از پکیج یا حذف کامل کالا
+      • تغییر نام و قیمت خود پکیج و همه آیتم‌ها
+      • جمع قیمت زیرمجموعه‌ها به‌صورت خودکار قیمت کلی پکیج می‌شود
+    """
 
     def __init__(self, item_name, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"جزئیات پکیج: {item_name}")
-        self.resize(660, 540)
+        self.old_name = item_name
+        self.pkg_name = item_name
+        self.setWindowTitle(f"مدیریت پکیج: {item_name}")
+        self.resize(820, 700)
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
+        persist_dialog(self, "dlg_package")
+        self._delete_list = []
 
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute("SELECT code, price, is_package, parent_package FROM item_prices WHERE item_name=?",
-                       (item_name,))
-        row = cursor.fetchone()
-        cursor.execute("SELECT item_name, code, price FROM item_prices WHERE parent_package=? ORDER BY item_name",
-                       (item_name,))
-        subs = cursor.fetchall()
+        cursor.execute("SELECT code, price, is_package FROM item_prices WHERE item_name=?", (item_name,))
+        row = cursor.fetchone() or ("", 0, 1)
         conn.close()
 
+        self._code = row[0] or ""
+        self._price = row[1] or 0
+
         lay = QVBoxLayout(self)
+        lay.setSpacing(8)
 
-        code = row[0] if row else "-"
-        price = row[1] if row else 0
-        is_pkg = row[2] if row else 0
+        # ---------- مشخصات پکیج ----------
+        pkg_box = QGroupBox("مشخصات پکیج")
+        pkg_form = QFormLayout()
+        self.txt_name = QLineEdit(item_name)
+        self.txt_code = QLineEdit(self._code)
+        self.chk_auto = QCheckBox("قیمت پکیج = جمع قیمت همه زیرمجموعه‌ها (خودکار)")
+        self.chk_auto.setChecked(True)
+        self.txt_price = QLineEdit(f"{self._price:,}")
+        self.txt_price.textChanged.connect(lambda t: self.txt_price.setText(format_number(t)))
+        self.txt_price.setEnabled(False)
 
-        info = QLabel(
-            f"<div style='font-size:12pt; line-height:1.9;'>"
-            f"<b>نام:</b> {item_name}<br>"
-            f"<b>کد:</b> {code or '-'}<br>"
-            f"<b>نوع:</b> {'پکیج اصلی' if is_pkg else 'خدمت / کالای مستقل'}<br>"
-            f"<b>قیمت پکیج:</b> {price:,} تومان<br>"
-            f"<b>مبلغ به حروف:</b> {number_to_persian_words(price)} تومان"
-            f"</div>"
-        )
-        info.setStyleSheet("background-color:#eaf6ff; border:1px solid #a9d3ee; "
-                           "border-radius:8px; padding:12px;")
-        info.setWordWrap(True)
-        lay.addWidget(info)
+        self.chk_auto.toggled.connect(lambda on: self.txt_price.setEnabled(not on))
+        self.chk_auto.toggled.connect(lambda _: self.refresh_total())
 
-        lbl_subs = QLabel(f"{ico('package')} <b>زیرمجموعه‌های این پکیج ({len(subs)} مورد)</b>")
-        lay.addWidget(lbl_subs)
+        pkg_form.addRow(f"{ico('package')} نام پکیج:", self.txt_name)
+        pkg_form.addRow(f"{ico('list')} کد پکیج (یکتا):", self.txt_code)
+        pkg_form.addRow("", self.chk_auto)
+        pkg_form.addRow(f"{ico('money')} قیمت پکیج (تومان):", self.txt_price)
+        pkg_box.setLayout(pkg_form)
+        lay.addWidget(pkg_box)
 
-        table = QTableWidget()
-        table.setColumnCount(4)
-        table.setHorizontalHeaderLabels(["ردیف", "کد", "عنوان زیرمجموعه", "قیمت (تومان)"])
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        table.setAlternatingRowColors(True)
-        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        table.setRowCount(len(subs))
-        subs_sum = 0
-        for i, (sname, scode, sprice) in enumerate(subs):
-            subs_sum += sprice or 0
-            table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
-            table.setItem(i, 1, QTableWidgetItem(scode or "-"))
-            table.setItem(i, 2, QTableWidgetItem(sname))
-            table.setItem(i, 3, QTableWidgetItem(f"{sprice:,}"))
-        lay.addWidget(table)
+        # ---------- جدول زیرمجموعه‌ها ----------
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["ردیف", "کد", "نام آیتم / خدمت", "قیمت (تومان)"])
+        self.table.setAlternatingRowColors(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked |
+                                   QAbstractItemView.EditTrigger.EditKeyPressed |
+                                   QAbstractItemView.EditTrigger.AnyKeyPressed)
+        self.table.itemChanged.connect(lambda _i: self.refresh_total())
+        persist_table(self.table, "pkg_subs")
+        lay.addWidget(self.table, 1)
 
-        if subs:
-            diff = price - subs_sum
-            diff_txt = (f"<span style='color:#27ae60;'>صرفه‌جویی مشتری: {abs(diff):,} تومان</span>"
-                        if diff >= 0 else
-                        f"<span style='color:#c0392b;'>اختلاف: {abs(diff):,} تومان</span>")
-            lbl_sum = QLabel(
-                f"<b>جمع قیمت تک‌تک زیرمجموعه‌ها:</b> {subs_sum:,} تومان &nbsp;|&nbsp; "
-                f"<b>قیمت پکیج:</b> {price:,} تومان &nbsp;|&nbsp; {diff_txt}"
-            )
-            lbl_sum.setStyleSheet("background-color:#fff9e6; border:1px solid #f39c12; "
-                                  "border-radius:8px; padding:10px;")
-            lbl_sum.setWordWrap(True)
-            lay.addWidget(lbl_sum)
+        # ---------- دکمه‌های عملیات ----------
+        row1 = QHBoxLayout()
+        btn_add_new = QPushButton(ico_text("add", "افزودن آیتم جدید"))
+        btn_add_new.setStyleSheet("background-color:#27ae60; color:white; font-weight:bold; padding:8px;")
+        btn_add_new.clicked.connect(self.add_new_row)
 
-        btn_row = QHBoxLayout()
-        btn_print = QPushButton(ico_text("print", "چاپ جزئیات پکیج"))
+        btn_add_existing = QPushButton(ico_text("link", "افزودن از کالاهای موجود"))
+        btn_add_existing.setStyleSheet("background-color:#2980b9; color:white; font-weight:bold; padding:8px;")
+        btn_add_existing.clicked.connect(self.add_existing_item)
+
+        btn_detach = QPushButton(ico_text("cancel", "خارج کردن از پکیج"))
+        btn_detach.setStyleSheet("background-color:#e67e22; color:white; font-weight:bold; padding:8px;")
+        btn_detach.setToolTip("آیتم حذف نمی‌شود، فقط از این پکیج خارج می‌شود")
+        btn_detach.clicked.connect(self.detach_row)
+
+        btn_del = QPushButton(ico_text("delete", "حذف کامل کالا"))
+        btn_del.setStyleSheet("background-color:#c0392b; color:white; font-weight:bold; padding:8px;")
+        btn_del.setToolTip("کالا از کل برنامه حذف می‌شود")
+        btn_del.clicked.connect(self.delete_row)
+
+        for b in (btn_add_new, btn_add_existing, btn_detach, btn_del):
+            row1.addWidget(b)
+        lay.addLayout(row1)
+
+        self.lbl_total = QLabel("")
+        self.lbl_total.setWordWrap(True)
+        self.lbl_total.setStyleSheet("background-color:#fff9e6; border:1px solid #f39c12; "
+                                     "border-radius:8px; padding:10px; font-size:11pt;")
+        lay.addWidget(self.lbl_total)
+
+        row2 = QHBoxLayout()
+        btn_save = QPushButton(ico_text("save", "ذخیره همه تغییرات"))
+        btn_save.setStyleSheet("background-color:#16a085; color:white; font-weight:bold; padding:10px;")
+        btn_save.clicked.connect(self.save_all)
+        btn_print = QPushButton(ico_text("print", "چاپ / PDF جزئیات"))
         btn_print.clicked.connect(self.print_details)
         btn_close = QPushButton(ico_text("cancel", "بستن"))
-        btn_close.clicked.connect(self.accept)
-        btn_row.addWidget(btn_print)
-        btn_row.addWidget(btn_close)
-        lay.addLayout(btn_row)
+        btn_close.clicked.connect(self.reject)
+        row2.addWidget(btn_save, 2)
+        row2.addWidget(btn_print, 2)
+        row2.addWidget(btn_close, 1)
+        lay.addLayout(row2)
 
-        self._item_name = item_name
-        self._code = code
-        self._price = price
-        self._subs = subs
+        self.load_subs()
 
-    def print_details(self):
-        studio_name = get_setting("studio_name", "IMART STUDIO")
+    # ---------------- بارگذاری و محاسبه ----------------
+    def load_subs(self):
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT item_name, code, price FROM item_prices "
+                       "WHERE parent_package=? ORDER BY item_name", (self.pkg_name,))
+        subs = cursor.fetchall()
+        conn.close()
+        self.table.blockSignals(True)
+        self.table.setRowCount(0)
+        for i, (n, c, p) in enumerate(subs):
+            self._insert_row(i + 1, c or "", n, p or 0)
+        self.table.blockSignals(False)
+        self.refresh_total()
+
+    def _insert_row(self, idx, code, name, price):
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        it_idx = QTableWidgetItem(str(idx))
+        it_idx.setFlags(Qt.ItemFlag.ItemIsEnabled)
+        it_idx.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.table.setItem(r, 0, it_idx)
+        self.table.setItem(r, 1, QTableWidgetItem(code or ""))
+        self.table.setItem(r, 2, QTableWidgetItem(name))
+        it_price = QTableWidgetItem(f"{int(price or 0):,}")
+        it_price.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.table.setItem(r, 3, it_price)
+
+    def _renumber(self):
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 0)
+            if it:
+                it.setText(str(r + 1))
+
+    def current_subs(self):
+        subs = []
+        for r in range(self.table.rowCount()):
+            name_it = self.table.item(r, 2)
+            name = name_it.text().strip() if name_it else ""
+            if not name:
+                continue
+            code_it = self.table.item(r, 1)
+            price_it = self.table.item(r, 3)
+            subs.append((name,
+                         (code_it.text().strip() if code_it else ""),
+                         parse_number(price_it.text() if price_it else "0")))
+        return subs
+
+    def refresh_total(self):
+        subs = self.current_subs()
+        total = sum(p for _, _, p in subs)
+        if self.chk_auto.isChecked():
+            self.txt_price.setText(f"{total:,}")
+            price = total
+        else:
+            price = parse_number(self.txt_price.text())
+        self.lbl_total.setText(
+            f"<b>تعداد زیرمجموعه‌ها:</b> {len(subs)}  |  "
+            f"<b>جمع قیمت زیرمجموعه‌ها:</b> {total:,} تومان<br>"
+            f"<b>قیمت نهایی این پکیج:</b> {price:,} تومان  |  "
+            f"<b>به حروف:</b> {number_to_persian_words(price)} تومان"
+        )
+
+    # ---------------- عملیات جدول ----------------
+    def add_new_row(self):
+        self.table.blockSignals(True)
+        self._insert_row(self.table.rowCount() + 1, "", "", 0)
+        self.table.blockSignals(False)
+        r = self.table.rowCount() - 1
+        self.table.setCurrentCell(r, 2)
+        self.table.editItem(self.table.item(r, 2))
+        self.refresh_total()
+
+    def add_existing_item(self):
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT item_name FROM item_prices "
+                       "WHERE (parent_package IS NULL OR parent_package='' OR parent_package<>?) "
+                       "AND item_name<>? ORDER BY item_name", (self.pkg_name, self.pkg_name))
+        names = [r[0] for r in cursor.fetchall()]
+        conn.close()
+        if not names:
+            QMessageBox.information(self, "افزودن آیتم",
+                                    "کالای آزاد دیگری برای افزودن وجود ندارد.\n"
+                                    "ابتدا از بخش انبار یا مدیریت کالاها آیتم جدید بسازید.")
+            return
+        name, ok = QInputDialog.getItem(self, "افزودن از کالاهای موجود",
+                                        "کالا / خدمت را انتخاب کنید:", names, 0, False)
+        if not ok or not name:
+            return
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT code, price FROM item_prices WHERE item_name=?", (name,))
+        r = cursor.fetchone()
+        conn.close()
+        code = r[0] if r else ""
+        price = r[1] if r else 0
+        self.table.blockSignals(True)
+        self._insert_row(self.table.rowCount() + 1, code, name, price)
+        self.table.blockSignals(False)
+        self.refresh_total()
+
+    def detach_row(self):
+        r = self.table.currentRow()
+        if r < 0:
+            QMessageBox.warning(self, "خطا", "لطفاً یک ردیف را انتخاب کنید.")
+            return
+        self.table.removeRow(r)
+        self._renumber()
+        self.refresh_total()
+
+    def delete_row(self):
+        r = self.table.currentRow()
+        if r < 0:
+            QMessageBox.warning(self, "خطا", "لطفاً یک ردیف را انتخاب کنید.")
+            return
+        name_it = self.table.item(r, 2)
+        if name_it and name_it.text().strip():
+            self._delete_list.append(name_it.text().strip())
+        self.table.removeRow(r)
+        self._renumber()
+        self.refresh_total()
+
+    # ---------------- ذخیره ----------------
+    def save_all(self):
+        if not ask_security_password(self):
+            return
+        new_name = self.txt_name.text().strip()
+        if not new_name:
+            QMessageBox.warning(self, "خطا", "نام پکیج نمی‌تواند خالی باشد.")
+            return
+
+        subs = self.current_subs()
+        subs_total = sum(p for _, _, p in subs)
+        price = subs_total if self.chk_auto.isChecked() else parse_number(self.txt_price.text())
+        code = self.txt_code.text().strip() or generate_unique_code(
+            "PKG", "item_prices", "code", start=2001)
+
+        # یکتا بودن کد
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT item_name FROM item_prices WHERE code=? AND item_name<>?",
+                       (code, self.old_name))
+        dup = cursor.fetchone()
+        cursor.execute("SELECT item_name FROM item_prices WHERE parent_package=?",
+                       (self.old_name,))
+        old_subs = {r[0] for r in cursor.fetchall()}
+        conn.close()
+        if dup:
+            QMessageBox.warning(self, "کد تکراری",
+                                f"کد «{code}» قبلاً برای «{dup[0]}» ثبت شده است.")
+            return
+
+        # نام و قیمت خود پکیج
+        if new_name != self.old_name:
+            sync_item_everywhere(self.old_name, new_name, code, price, 1, "")
+        else:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE item_prices SET code=?, price=?, is_package=1, parent_package='' "
+                           "WHERE item_name=?", (code, price, self.old_name))
+            conn.commit()
+            conn.close()
+
+        self.pkg_name = new_name
+        self.old_name = new_name
+        keep = {n for n, _, _ in subs}
+
+        # زیرمجموعه‌هایی که از جدول حذف شده‌اند، از پکیج خارج می‌شوند
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        for name in old_subs - keep:
+            cursor.execute("UPDATE item_prices SET parent_package='' WHERE item_name=?", (name,))
+        # کالاهایی که کاربر «حذف کامل» را زده
+        for name in self._delete_list:
+            cursor.execute("DELETE FROM item_prices WHERE item_name=?", (name,))
+            cursor.execute("DELETE FROM inventory WHERE item_name=?", (name,))
+        self._delete_list = []
+
+        # درج یا به‌روزرسانی زیرمجموعه‌ها
+        for n, c, p in subs:
+            if n == new_name:
+                continue
+            cursor.execute('''
+                INSERT INTO item_prices (item_name, code, price, is_package, parent_package)
+                VALUES (?, ?, ?, 0, ?)
+                ON CONFLICT(item_name) DO UPDATE SET
+                    code=excluded.code, price=excluded.price,
+                    is_package=0, parent_package=excluded.parent_package
+            ''', (n, c or generate_unique_code("SRV", "item_prices", "code", start=1001), p, new_name))
+            cursor.execute("INSERT OR IGNORE INTO inventory (item_name, total_count, used_count) "
+                           "VALUES (?, 0, 0)", (n,))
+
+        # قیمت پکیج هم برابر جمع زیرمجموعه‌ها
+        cursor.execute("UPDATE item_prices SET price=? WHERE item_name=?", (price, new_name))
+        cursor.execute("INSERT OR IGNORE INTO inventory (item_name, total_count, used_count) "
+                       "VALUES (?, 0, 0)", (new_name,))
+        conn.commit()
+        conn.close()
+
+        recalc_inventory_usage()
+        self.setWindowTitle(f"مدیریت پکیج: {new_name}")
+        self.chk_auto.setChecked(True)
+        self.load_subs()
+        QMessageBox.information(
+            self, "موفقیت",
+            f"تغییرات پکیج «{new_name}» ذخیره شد.\n"
+            f"قیمت پکیج برابر جمع {len(subs)} زیرمجموعه = {price:,} تومان شد.")
+
+    # ---------------- چاپ و PDF ----------------
+    def _html(self, mono=False):
+        subs = self.current_subs()
+        total = sum(p for _, _, p in subs)
+        price = total if self.chk_auto.isChecked() else parse_number(self.txt_price.text())
+        p = doc_palette(mono)
+        studio_name, studio_phone, _a = InvoiceBuilder._studio_info()
         now = jdatetime.datetime.now()
-        rows = "".join(
-            f"<tr><td style='border:1px solid #333; padding:6px; text-align:center;'>{i+1}</td>"
-            f"<td style='border:1px solid #333; padding:6px; text-align:center;'>{c or '-'}</td>"
-            f"<td style='border:1px solid #333; padding:6px;'>{n}</td>"
-            f"<td style='border:1px solid #333; padding:6px; text-align:center;'>{p:,}</td></tr>"
-            for i, (n, c, p) in enumerate(self._subs)
-        ) or "<tr><td colspan='4' style='border:1px solid #333; padding:6px; text-align:center;'>زیرمجموعه‌ای ثبت نشده</td></tr>"
 
-        html = f"""
-        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma;">
-          <h1 style="text-align:center; color:#1F4E78; margin:0;">{studio_name}</h1>
-          <h3 style="text-align:center; margin:4px 0 14px 0;">جزئیات پکیج</h3>
-          <table width="100%"  style="border-collapse:collapse;margin-bottom:12px">
-            <tr><td style="padding:6px;"><b>نام پکیج:</b> {self._item_name}</td>
-                <td style="padding:6px;"><b>کد:</b> {self._code or '-'}</td></tr>
-            <tr><td style="padding:6px;"><b>قیمت پکیج:</b> {self._price:,} تومان</td>
-                <td style="padding:6px;"><b>تاریخ:</b> {now.strftime('%Y/%m/%d')}</td></tr>
+        rows = ""
+        for i, (n, c, pr) in enumerate(subs, start=1):
+            rows += InvoiceBuilder._row([
+                InvoiceBuilder._td(str(i), size="8pt"),
+                InvoiceBuilder._td(c or "-", size="8pt"),
+                InvoiceBuilder._td(n, align="right", size="8pt"),
+                InvoiceBuilder._td(f"{pr:,}", size="8pt"),
+            ])
+        if not rows:
+            rows = f"<tr>{InvoiceBuilder._td('زیرمجموعه‌ای ثبت نشده', colspan=4, size='9pt')}</tr>"
+
+        return f"""
+        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:9pt;">
+          {InvoiceBuilder._title_band(
+              p, studio_name,
+              "<div style='font-size:10pt;'>جزئیات پکیج</div>",
+              [f"تاریخ: {now.strftime('%Y/%m/%d')}"])}
+          <table width="100%" style="border-collapse:collapse; margin-top:5px;">
+            {InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>نام پکیج:</b>", align="right", bg=p['box_bg'], size="9pt", width="22%"),
+                InvoiceBuilder._td(self.txt_name.text(), align="right", size="9pt"),
+                InvoiceBuilder._td("<b>کد:</b>", align="right", bg=p['box_bg'], size="9pt", width="14%"),
+                InvoiceBuilder._td(self.txt_code.text() or "-", align="right", size="9pt"),
+            ])}
           </table>
-          <table width="100%"  style="border-collapse:collapse">
-            <thead><tr style="background-color:#D9E1F2;">
-              <th style="border:1px solid #333; padding:6px;">ردیف</th>
-              <th style="border:1px solid #333; padding:6px;">کد</th>
-              <th style="border:1px solid #333; padding:6px;">عنوان</th>
-              <th style="border:1px solid #333; padding:6px;">قیمت (تومان)</th>
-            </tr></thead>
+          <table width="100%" style="border-collapse:collapse; margin-top:5px;">
+            <thead>{InvoiceBuilder._head(['ردیف', 'کد', 'عنوان زیرمجموعه', 'قیمت (تومان)'],
+                                         bg=p['table_head'], fg=p['table_head_fg'])}</thead>
             <tbody>{rows}</tbody>
+            <tfoot>
+              {InvoiceBuilder._row([
+                  InvoiceBuilder._td("<b>جمع قیمت زیرمجموعه‌ها</b>", align="right",
+                                     colspan=3, bg=p['alt_row'], size="9pt", bold=True),
+                  InvoiceBuilder._td(f"<b>{total:,}</b>", bg=p['alt_row'], size="9pt", bold=True),
+              ])}
+              {InvoiceBuilder._row([
+                  InvoiceBuilder._td("<b>قیمت نهایی پکیج</b>", align="right",
+                                     colspan=3, bg=p['total_bg'], size="10pt", bold=True),
+                  InvoiceBuilder._td(f"<b>{price:,}</b>", bg=p['total_bg'], size="10pt", bold=True),
+              ])}
+            </tfoot>
           </table>
-          <p style="margin-top:10px;"><b>مبلغ پکیج به حروف:</b> {number_to_persian_words(self._price)} تومان</p>
+          <div style="margin-top:6px; font-size:8.5pt;">
+            <b>قیمت پکیج به حروف:</b> {number_to_persian_words(price)} تومان
+          </div>
+          <div style="text-align:center; margin-top:9px; font-size:7pt; color:{p['muted']};">
+            {studio_name} | تلفن: {studio_phone}
+          </div>
         </div>
         """
-        print_html_document(html, self, f"جزئیات پکیج {self._item_name}")
+
+    def print_details(self):
+        dlg = PrintChoiceDialog(self, "چاپ / PDF جزئیات پکیج",
+                                allow_details=False, allow_staff=False)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dlg.mode == "pdf":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "ذخیره PDF",
+                f"جزئیات_پکیج_{self.txt_name.text()}.pdf", "PDF Files (*.pdf)")
+            if not path:
+                return
+            ok, err = save_html_pdf(self._html(mono=False), path, "جزئیات پکیج")
+            if ok:
+                QMessageBox.information(self, "موفقیت", f"فایل PDF ذخیره شد:\n{path}")
+            else:
+                QMessageBox.critical(self, "خطا", f"ساخت PDF ناموفق بود:\n{err}")
+        else:
+            print_html_document(self._html(mono=True), self, "جزئیات پکیج")
 
 
 # ============================================================
 # ================  ChartDialog (نمایش نمودار)  ==============
 # ============================================================
 class ChartDialog(QDialog):
-    """نمایش نمودار matplotlib با عنوان فارسی درست و امکان چاپ/ذخیره"""
+    """نمایش نمودار با عنوان فارسی درست و امکان چاپ سیاه‌وسفید / ذخیره رنگی"""
 
     def __init__(self, figure, title, parent=None):
         super().__init__(parent)
@@ -1939,6 +2540,7 @@ class ChartDialog(QDialog):
         self.resize(980, 660)
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
+        persist_dialog(self, "dlg_chart")
 
         lay = QVBoxLayout(self)
         head = QLabel(f"{ico('chart')}  {title}")
@@ -1962,7 +2564,7 @@ class ChartDialog(QDialog):
         btn_excel.setStyleSheet("background-color:#1e8449; color:white; font-weight:bold; padding:8px;")
         btn_excel.clicked.connect(self.save_excel)
 
-        btn_print = QPushButton(ico_text("print", "چاپ نمودار"))
+        btn_print = QPushButton(ico_text("print", "چاپ (سیاه و سفید)"))
         btn_print.setStyleSheet("background-color:#2980b9; color:white; font-weight:bold; padding:8px;")
         btn_print.clicked.connect(self.print_chart)
 
@@ -1984,7 +2586,8 @@ class ChartDialog(QDialog):
         if not path:
             return
         try:
-            self.figure.savefig(path, dpi=170, bbox_inches="tight", facecolor=self.figure.get_facecolor())
+            self.figure.savefig(path, dpi=170, bbox_inches="tight",
+                                facecolor=self.figure.get_facecolor())
             QMessageBox.information(self, "موفقیت", "تصویر نمودار ذخیره شد.")
         except Exception as e:
             QMessageBox.critical(self, "خطا", str(e))
@@ -2010,28 +2613,241 @@ class ChartDialog(QDialog):
         rows = []
         for ax in self.figure.axes:
             for patch, label in zip(ax.patches, ax.get_xticklabels()):
-                rows.append([label.get_text(), int(patch.get_height())])
+                try:
+                    rows.append([label.get_text(), int(patch.get_height())])
+                except Exception:
+                    pass
         ok, err = export_rows_to_excel(headers, rows, path, "نمودار", self.chart_title)
         if ok:
             QMessageBox.information(self, "موفقیت", "خروجی اکسل ذخیره شد.")
         else:
             QMessageBox.critical(self, "خطا", err)
 
-    def _html_with_image(self):
-        import io
-        import base64
-        buf = io.BytesIO()
-        self.figure.savefig(buf, format="png", dpi=150, bbox_inches="tight",
-                            facecolor=self.figure.get_facecolor())
+    def _png_bytes(self, gray=False, dpi=150):
+        import io as _io
+        buf = _io.BytesIO()
+        self.figure.savefig(buf, format="png", dpi=dpi, bbox_inches="tight",
+                            facecolor="white" if gray else self.figure.get_facecolor())
         buf.seek(0)
-        b64 = base64.b64encode(buf.read()).decode("ascii")
+        data = buf.read()
+        if gray:
+            try:
+                img = QImage.fromData(data, "PNG")
+                if not img.isNull():
+                    img = img.convertToFormat(QImage.Format.Format_Grayscale8)
+                    b2 = QByteArray()
+                    from PyQt6.QtCore import QBuffer
+                    qb = QBuffer(b2)
+                    qb.open(QBuffer.OpenModeFlag.WriteOnly)
+                    img.save(qb, "PNG")
+                    qb.close()
+                    data = bytes(b2)
+            except Exception as e:
+                print("[CHART] gray convert failed:", e)
+        return data
+
+    def _html_with_image(self, gray=False):
+        import base64
+        b64 = base64.b64encode(self._png_bytes(gray=gray)).decode("ascii")
         return (f"<div dir='rtl' style=\"font-family:'{INVOICE_FONT_FAMILY}', Tahoma;\">"
                 f"<h2 style='text-align:center; color:#1F4E78;'>{self.chart_title}</h2>"
                 f"<img src='data:image/png;base64,{b64}' style='width:100%;'/>"
                 f"</div>")
 
     def print_chart(self):
-        print_html_document(self._html_with_image(), self, self.chart_title)
+        # پرینت سیاه و سفید می‌شود تا روی چاپگر لیزری تمیز باشد
+        print_html_document(self._html_with_image(gray=True), self, self.chart_title)
+# ============================================================
+# ======  SettlementStatusDialog (وضعیت تسویه پروژه‌ها)  ======
+# ============================================================
+class SettlementStatusDialog(QDialog):
+    """نمایش لیست پروژه‌ها و قراردادها بر اساس وضعیت تسویه"""
+
+    KIND_TITLES = {
+        "all": "کل پروژه‌ها و قراردادها",
+        "full": "تسویه کامل",
+        "partial": "تسویه ناقص",
+        "none": "تسویه نشده",
+    }
+
+    def __init__(self, kind, parent=None):
+        super().__init__(parent)
+        title = self.KIND_TITLES.get(kind, "وضعیت تسویه")
+        self.setWindowTitle(f"{title} - سال کاری {get_current_year()}")
+        self.resize(980, 620)
+        self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        self.setFont(QFont(APP_FONT_FAMILY, 10))
+        persist_dialog(self, "dlg_settlement")
+        self.kind = kind
+
+        work_year = get_current_year()
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        items = []
+        cursor.execute("""SELECT id, code, groom_name, bride_name, ceremony_date,
+                          total_amount, discount, paid_amount FROM wedding_contracts
+                          WHERE work_year=?""", (work_year,))
+        for r in cursor.fetchall():
+            net = max(0, (r[5] or 0) - (r[6] or 0))
+            state, remain = settlement_state(net, r[7])
+            items.append(("قرارداد عروسی", r[1], f"{r[2]} و {r[3]}", r[4], net, r[7] or 0, remain, state))
+        cursor.execute("""SELECT id, code, title, client_name, project_date,
+                          total_amount, paid_amount FROM commercial_projects
+                          WHERE work_year=?""", (work_year,))
+        for r in cursor.fetchall():
+            net = r[5] or 0
+            state, remain = settlement_state(net, r[6])
+            items.append(("پروژه تبلیغاتی", r[1], f"{r[2]} - {r[3] or '-'}", r[4], net, r[6] or 0, remain, state))
+        conn.close()
+
+        if kind == "full":
+            items = [i for i in items if i[7] == "تسویه کامل"]
+        elif kind == "partial":
+            items = [i for i in items if i[7] == "تسویه ناقص"]
+        elif kind == "none":
+            items = [i for i in items if i[7] == "تسویه نشده"]
+
+        lay = QVBoxLayout(self)
+        self.lbl_sum = QLabel("")
+        self.lbl_sum.setWordWrap(True)
+        self.lbl_sum.setStyleSheet("background-color:#eaf6ff; border:1px solid #a9d3ee; "
+                                   "border-radius:8px; padding:10px; font-size:11pt;")
+        lay.addWidget(self.lbl_sum)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(8)
+        self.table.setHorizontalHeaderLabels([
+            "نوع", "کد", "عنوان / نام", "تاریخ", "مبلغ نهایی", "پرداختی", "مانده", "وضعیت"
+        ])
+        self.table.setAlternatingRowColors(True)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setDefaultSectionSize(30)
+        persist_table(self.table, f"settle_{kind}", QHeaderView.ResizeMode.Stretch)
+        self.table.setRowCount(len(items))
+        total_net = total_paid = total_remain = 0
+        for i, it in enumerate(items):
+            total_net += it[4]
+            total_paid += it[5]
+            total_remain += it[6]
+            self.table.setItem(i, 0, QTableWidgetItem(it[0]))
+            self.table.setItem(i, 1, QTableWidgetItem(str(it[1] or "-")))
+            self.table.setItem(i, 2, QTableWidgetItem(str(it[2])))
+            self.table.setItem(i, 3, QTableWidgetItem(str(it[3] or "-")))
+            self.table.setItem(i, 4, QTableWidgetItem(f"{it[4]:,}"))
+            self.table.setItem(i, 5, QTableWidgetItem(f"{it[5]:,}"))
+            remain_item = QTableWidgetItem(f"{it[6]:,}")
+            remain_item.setForeground(QColor("#c0392b" if it[6] > 0 else "#27ae60"))
+            self.table.setItem(i, 6, remain_item)
+            st_item = QTableWidgetItem(it[7])
+            st_item.setForeground(QColor(
+                "#27ae60" if it[7] == "تسویه کامل"
+                else ("#e67e22" if it[7] == "تسویه ناقص" else "#c0392b")))
+            f = st_item.font()
+            f.setBold(True)
+            st_item.setFont(f)
+            self.table.setItem(i, 7, st_item)
+        lay.addWidget(self.table)
+
+        self.lbl_sum.setText(
+            f"<b>{title}</b> - سال کاری {work_year} | "
+            f"<b>تعداد:</b> {len(items)} | "
+            f"<b>جمع مبلغ نهایی:</b> {total_net:,} تومان | "
+            f"<b>جمع پرداختی:</b> {total_paid:,} تومان | "
+            f"<b style='color:#c0392b;'>جمع مانده:</b> {total_remain:,} تومان"
+        )
+
+        row = QHBoxLayout()
+        btn_pdf = QPushButton(ico_text("pdf", "PDF / چاپ"))
+        btn_pdf.setStyleSheet("background-color:#2980b9; color:white; font-weight:bold; padding:8px;")
+        btn_pdf.clicked.connect(lambda: self.output(title, items, total_net, total_paid, total_remain))
+        btn_excel = QPushButton(ico_text("excel", "خروجی اکسل"))
+        btn_excel.setStyleSheet("background-color:#1e8449; color:white; font-weight:bold; padding:8px;")
+        btn_excel.clicked.connect(lambda: self.export_excel(title))
+        btn_close = QPushButton(ico_text("ok", "بستن"))
+        btn_close.clicked.connect(self.accept)
+        row.addWidget(btn_pdf)
+        row.addWidget(btn_excel)
+        row.addStretch()
+        row.addWidget(btn_close)
+        lay.addLayout(row)
+
+    def export_excel(self, title):
+        path, _ = QFileDialog.getSaveFileName(self, "خروجی اکسل", f"{title}.xlsx", "Excel (*.xlsx)")
+        if not path:
+            return
+        headers = [self.table.horizontalHeaderItem(c).text() for c in range(self.table.columnCount())]
+        rows = [[self.table.item(r, c).text() if self.table.item(r, c) else ""
+                 for c in range(self.table.columnCount())] for r in range(self.table.rowCount())]
+        ok, err = export_rows_to_excel(headers, rows, path, title, title)
+        if ok:
+            QMessageBox.information(self, "موفقیت", f"خروجی اکسل ذخیره شد:\n{path}")
+        else:
+            QMessageBox.critical(self, "خطا", err)
+
+    def output(self, title, items, total_net, total_paid, total_remain):
+        dlg = PrintChoiceDialog(self, title, allow_details=False, allow_staff=False)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        mono = (dlg.mode == "print")
+        html = self._html(title, items, total_net, total_paid, total_remain, mono)
+        if mono:
+            print_html_document(html, self, title)
+        else:
+            path, _ = QFileDialog.getSaveFileName(self, "ذخیره PDF", f"{title}.pdf", "PDF Files (*.pdf)")
+            if not path:
+                return
+            ok, err = save_html_pdf(html, path, title)
+            if ok:
+                QMessageBox.information(self, "موفقیت", f"فایل PDF ذخیره شد:\n{path}")
+            else:
+                QMessageBox.critical(self, "خطا", err)
+
+    def _html(self, title, items, total_net, total_paid, total_remain, mono=False):
+        p = doc_palette(mono)
+        studio_name, studio_phone, _a = InvoiceBuilder._studio_info()
+        now = jdatetime.datetime.now()
+        rows = ""
+        for i, it in enumerate(items, start=1):
+            rows += InvoiceBuilder._row([
+                InvoiceBuilder._td(str(i), size="8pt"),
+                InvoiceBuilder._td(str(it[1] or "-"), size="8pt"),
+                InvoiceBuilder._td(str(it[2]), align="right", size="8pt"),
+                InvoiceBuilder._td(str(it[3] or "-"), size="8pt"),
+                InvoiceBuilder._td(f"{it[4]:,}", size="8pt"),
+                InvoiceBuilder._td(f"{it[5]:,}", size="8pt"),
+                InvoiceBuilder._td(f"{it[6]:,}", size="8pt"),
+                InvoiceBuilder._td(it[7], size="8pt"),
+            ])
+        if not rows:
+            rows = f"<tr>{InvoiceBuilder._td('موردی در این دسته وجود ندارد', colspan=8, size='9pt')}</tr>"
+
+        return f"""
+        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:9pt;">
+          {InvoiceBuilder._title_band(
+              p, studio_name,
+              f"<div style='font-size:10pt;'>{title} - سال کاری {get_current_year()}</div>",
+              [f"تاریخ: {now.strftime('%Y/%m/%d')}", f"تعداد موارد: {len(items)}"])}
+          <table width="100%" style="border-collapse:collapse; margin-top:6px;">
+            <thead>{InvoiceBuilder._head(['ردیف', 'کد', 'عنوان / نام', 'تاریخ', 'مبلغ نهایی',
+                                          'پرداختی', 'مانده', 'وضعیت'],
+                                         bg=p['table_head'], fg=p['table_head_fg'])}</thead>
+            <tbody>{rows}</tbody>
+            <tfoot>
+              {InvoiceBuilder._row([
+                  InvoiceBuilder._td('<b>جمع کل</b>', align='right', colspan=4,
+                                     bg=p['total_bg'], size='9pt', bold=True),
+                  InvoiceBuilder._td(f"<b>{total_net:,}</b>", bg=p['total_bg'], size='9pt', bold=True),
+                  InvoiceBuilder._td(f"<b>{total_paid:,}</b>", bg=p['total_bg'], size='9pt', bold=True),
+                  InvoiceBuilder._td(f"<b>{total_remain:,}</b>", bg=p['total_bg'], size='9pt', bold=True),
+                  InvoiceBuilder._td("", bg=p['total_bg'], size='9pt'),
+              ])}
+            </tfoot>
+          </table>
+          <div style="text-align:center; margin-top:8px; font-size:7pt; color:{p['muted']};">
+            {studio_name} | تلفن: {studio_phone}
+          </div>
+        </div>
+        """
 
 
 class LoadingScreen(QWidget):
@@ -2139,6 +2955,7 @@ class ManageItemsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("مدیریت پکیج‌ها، زیرمجموعه‌ها، کالاها و انبار")
         self.resize(880, 720)
+        persist_dialog(self, "dlg_manage_items")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
 
@@ -2470,6 +3287,7 @@ class ItemEditDialog(QDialog):
         self.old_name = item_name
         self.setWindowTitle(f"ویرایش: {item_name}")
         self.resize(560, 480)
+        persist_dialog(self, "dlg_item_edit")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
 
@@ -2598,6 +3416,7 @@ class DepositsDialog(QDialog):
         self.contract_id = contract_id
         self.setWindowTitle(f"مدیریت بیعانه‌ها و پرداخت‌های قرارداد #{contract_id}")
         self.resize(680, 520)
+        persist_dialog(self, "dlg_deposits")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
 
@@ -2690,12 +3509,12 @@ class DepositsDialog(QDialog):
             settle = "✅ تسویه شده" if remain <= 0 else "⏳ در جریان"
             self.lbl_summary.setText(
                 f"<b>زوجین:</b> {groom} و {bride}<br>"
-                f"<b>جمع خام:</b> {raw:,} تومان &nbsp;|&nbsp; "
-                f"<b>تخفیف:</b> {discount:,} &nbsp;|&nbsp; "
+                f"<b>جمع خام:</b> {raw:,} تومان  |  "
+                f"<b>تخفیف:</b> {discount:,}  |  "
                 f"<b>مبلغ نهایی:</b> {net:,} تومان<br>"
-                f"<b>جمع پرداختی‌ها:</b> {running:,} تومان &nbsp;|&nbsp; "
+                f"<b>جمع پرداختی‌ها:</b> {running:,} تومان  |  "
                 f"<b style='color:{'#27ae60' if remain <= 0 else '#c0392b'};'>مانده: {remain:,} تومان</b> "
-                f"&nbsp;|&nbsp; {settle}"
+                f" |  {settle}"
             )
         elif not rows:
             self.lbl_summary.setText("هنوز پرداختی برای این قرارداد ثبت نشده است.")
@@ -2758,6 +3577,7 @@ class ContractDetailsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(f"جزئیات کامل قرارداد #{contract_id}")
         self.resize(780, 680)
+        persist_dialog(self, "dlg_contract_details")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
 
@@ -2853,12 +3673,12 @@ class ContractDetailsDialog(QDialog):
 
             summary = (
                 f"<div style='font-size:11pt; line-height:1.9;'>"
-                f"<b>جمع قیمت خام:</b> {raw:,} تومان &nbsp;|&nbsp; "
+                f"<b>جمع قیمت خام:</b> {raw:,} تومان  |  "
                 f"<b>تخفیف:</b> {discount:,} تومان<br>"
-                f"<b>جمع کل بعد از تخفیف:</b> <span style='color:#2980b9;'>{net:,} تومان</span> &nbsp;|&nbsp; "
+                f"<b>جمع کل بعد از تخفیف:</b> <span style='color:#2980b9;'>{net:,} تومان</span>  |  "
                 f"<b>پرداختی:</b> {paid:,} تومان<br>"
                 f"<b style='color:#c0392b;'>مانده:</b> {remain:,} تومان<br>"
-                f"<b>مبلغ مانده به حروف:</b> {words} تومان &nbsp;|&nbsp; "
+                f"<b>مبلغ مانده به حروف:</b> {words} تومان  |  "
                 f"<b>حقوق نیروی کار:</b> {staff_total:,} تومان"
                 f"</div>"
             )
@@ -2899,6 +3719,7 @@ class EditContractDialog(QDialog):
         self.contract_id = contract_id
         self.setWindowTitle(f"ویرایش قرارداد #{contract_id}")
         self.resize(780, 860)
+        persist_dialog(self, "dlg_edit_contract")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
 
@@ -2909,7 +3730,7 @@ class EditContractDialog(QDialog):
         cursor = conn.cursor()
         cursor.execute("""SELECT groom_name, bride_name, groom_phone, bride_phone,
                           contract_date, ceremony_date, selected_items, total_amount,
-                          discount, description, staff_ids, paid_amount
+                          discount, description, staff_ids, paid_amount, venue
                           FROM wedding_contracts WHERE id=?""", (contract_id,))
         row = cursor.fetchone()
 
@@ -2930,8 +3751,10 @@ class EditContractDialog(QDialog):
         self.discount = QLineEdit(f"{row[8]:,}" if row else "0")
         self.discount.textChanged.connect(lambda t: self.discount.setText(format_number(t)))
         self.discount.textChanged.connect(lambda _: self.recalc())
+        self.venue = QLineEdit(row[12] if row and len(row) > 12 else "")
+        self.venue.setPlaceholderText("نام تالار / باغ / مکان برگزاری مراسم")
         self.desc = QTextEdit(row[9] if row else "")
-        self.desc.setFixedHeight(70)
+        self.desc.setFixedHeight(60)
 
         form_layout.addRow(f"{ico('wedding')} نام داماد:", self.groom)
         form_layout.addRow(f"{ico('wedding')} نام عروس:", self.bride)
@@ -2939,6 +3762,7 @@ class EditContractDialog(QDialog):
         form_layout.addRow(f"{ico('people')} تلفن عروس:", self.bride_phone)
         form_layout.addRow(f"{ico('calendar')} تاریخ قرارداد (روز/ماه/سال):", self.contract_date)
         form_layout.addRow(f"{ico('calendar')} تاریخ مراسم (روز/ماه/سال):", self.ceremony_date)
+        form_layout.addRow(f"{ico('home')} مکان مراسم:", self.venue)
         form_layout.addRow(f"{ico('money')} تخفیف (تومان):", self.discount)
 
         selected = [x.strip() for x in (row[6].split(',') if row and row[6] else []) if x.strip()]
@@ -2946,7 +3770,8 @@ class EditContractDialog(QDialog):
         items_box_layout = QVBoxLayout()
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setFixedHeight(230)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFixedHeight(240)
 
         inner = QWidget()
         inner_layout = QVBoxLayout()
@@ -2956,8 +3781,11 @@ class EditContractDialog(QDialog):
         for item_name, code, price, is_pkg, parent in all_items:
             row_w = QWidget()
             row_l = QHBoxLayout()
-            row_l.setContentsMargins(18 if parent else 0, 0, 0, 0)
-            cb = QCheckBox(f"{'└ ' if parent else ''}[{code or '-'}] {item_name}")
+            row_w.setFixedHeight(26)
+            row_l.setContentsMargins(16 if parent else 0, 0, 0, 0)
+            row_l.setSpacing(5)
+            cb = ElidedCheckBox(f"{'• ' if parent else ''}[{code or '-'}] {item_name}")
+            cb.setFont(QFont(APP_FONT_FAMILY, 9))
             cb.setChecked(item_name in selected)
             cb.stateChanged.connect(self.recalc)
             txt = QLineEdit(f"{price:,}")
@@ -2997,7 +3825,8 @@ class EditContractDialog(QDialog):
         staff_box_layout = QVBoxLayout()
         staff_scroll = QScrollArea()
         staff_scroll.setWidgetResizable(True)
-        staff_scroll.setFixedHeight(170)
+        staff_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        staff_scroll.setFixedHeight(150)
         staff_inner = QWidget()
         staff_inner_layout = QVBoxLayout()
         self.staff_checks = {}
@@ -3074,11 +3903,11 @@ class EditContractDialog(QDialog):
                 staff_total += parse_number(self.staff_wages[pid].text())
 
         self.lbl_calc.setText(
-            f"<b>جمع قیمت خام:</b> {raw:,} تومان &nbsp;|&nbsp; "
-            f"<b>تخفیف:</b> {discount:,} تومان &nbsp;|&nbsp; "
+            f"<b>جمع قیمت خام:</b> {raw:,} تومان  |  "
+            f"<b>تخفیف:</b> {discount:,} تومان  |  "
             f"<b>جمع کل بعد از تخفیف:</b> <span style='color:#2980b9;'>{net:,} تومان</span><br>"
             f"<b>مبلغ به حروف:</b> {number_to_persian_words(net)} تومان<br>"
-            f"<b>نیروی کار انتخاب‌شده:</b> {count_staff} نفر &nbsp;|&nbsp; "
+            f"<b>نیروی کار انتخاب‌شده:</b> {count_staff} نفر  |  "
             f"<b>جمع حقوق این قرارداد:</b> {staff_total:,} تومان"
         )
 
@@ -3117,13 +3946,13 @@ class EditContractDialog(QDialog):
         cursor.execute("""UPDATE wedding_contracts SET
             groom_name=?, bride_name=?, groom_phone=?, bride_phone=?,
             contract_date=?, ceremony_date=?, selected_items=?,
-            total_amount=?, discount=?, description=?, staff_ids=?, is_settled=?
+            total_amount=?, discount=?, description=?, staff_ids=?, is_settled=?, venue=?
             WHERE id=?""",
             (self.groom.text(), self.bride.text(), self.groom_phone.text(),
              self.bride_phone.text(), self.contract_date.text(), self.ceremony_date.text(),
              ",".join(selected_items), raw_total, discount,
              self.desc.toPlainText(), json.dumps(staff_list, ensure_ascii=False),
-             is_settled, self.contract_id))
+             is_settled, self.venue.text().strip(), self.contract_id))
         conn.commit()
         conn.close()
 
@@ -3162,6 +3991,7 @@ class EditCommercialDialog(QDialog):
         self.project_id = project_id
         self.setWindowTitle(f"ویرایش پروژه #{project_id}")
         self.resize(500, 500)
+        persist_dialog(self, "dlg_edit_commercial")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
 
@@ -3243,7 +4073,14 @@ class EditCommercialDialog(QDialog):
 # ====================  InvoiceBuilder  =====================
 # ============================================================
 class InvoiceBuilder:
-    """سازنده اسناد چاپی و PDF فارسی (فاکتور، رسید، گزارش) — نسخه ۱۰"""
+    """
+    سازنده اسناد چاپی و PDF فارسی — نسخه ۱۱
+    • همه اسناد روی یک برگ A5 و با بزرگ‌ترین فونت ممکن
+    • خروجی PDF رنگی و خروجی پرینت سیاه‌وسفید (mono)
+    • ترتیب ستون‌ها اصلاح‌شده برای خواندن راست‌به‌چپ (ردیف اولین ستون از راست)
+    • بخش چک‌ها فقط در صورت وجود چک چاپ می‌شود
+    • بخش نیروی کار قابل نمایش/حذف در چاپ است
+    """
 
     # ============================================================
     # ====================  ابزارهای داخلی  ======================
@@ -3257,12 +4094,48 @@ class InvoiceBuilder:
         )
 
     @staticmethod
+    def _rev(cells):
+        """
+        موتور متن Qt ترتیب ستون‌های جدول را برای RTL برنمی‌گرداند،
+        پس سلول‌ها را به ترتیب معکوس می‌نویسیم تا
+        ستون اول منطقی (مثل «ردیف») در سمت راست دیده شود.
+        """
+        return "".join(reversed(cells))
+
+    @staticmethod
+    def _row(cells, style="", height=None):
+        h = f" height='{height}'" if height else ""
+        st = f" style='{style}'" if style else ""
+        return f"<tr{st}{h}>{InvoiceBuilder._rev(cells)}</tr>"
+
+    @staticmethod
+    def _head(cells, bg="#2C6699", fg="#ffffff", size="7.5pt"):
+        parts = []
+        for c in cells:
+            parts.append(
+                f"<th style='border:1px solid #8a8a8a; padding:3px 4px; "
+                f"background-color:{bg}; color:{fg}; font-size:{size};'>{c}</th>")
+        return f"<tr>{InvoiceBuilder._rev(parts)}</tr>"
+
+    @staticmethod
+    def _td(text, align="center", size="7.5pt", bg=None, color=None, bold=False,
+            colspan=None, width=None):
+        st = [f"border:1px solid #8a8a8a", f"padding:3px 4px",
+              f"text-align:{align}", f"font-size:{size}"]
+        if bg:
+            st.append(f"background-color:{bg}")
+        if color:
+            st.append(f"color:{color}")
+        if bold:
+            st.append("font-weight:bold")
+        cs = f" colspan='{colspan}'" if colspan else ""
+        # عرض ستون باید اتریبیوت HTML باشد؛ موتور متن Qt مقدار CSS آن را نادیده می‌گیرد
+        ws = f" width='{width}'" if width else ""
+        return f"<td{cs}{ws} style='{';'.join(st)};'>{text}</td>"
+
+    @staticmethod
     def _items_breakdown(selected_items, items_detail, with_details=True):
-        """
-        ساخت سطرهای مفاد فاکتور.
-        با with_details=True زیرمجموعه‌های هر پکیج هم زیر آن نمایش داده می‌شوند
-        و با with_details=False فقط سرتیتر پکیج چاپ می‌شود.
-        """
+        """سطرهای مفاد فاکتور همراه با زیرمجموعه پکیج‌ها (در صورت انتخاب)"""
         rows = []
         idx = 0
         try:
@@ -3285,7 +4158,7 @@ class InvoiceBuilder:
                     for sname, scode, sprice in cursor.fetchall():
                         idx += 1
                         rows.append({"idx": idx, "code": scode or "-",
-                                     "name": f"└ {sname}", "price": int(sprice or 0),
+                                     "name": f"• {sname}", "price": int(sprice or 0),
                                      "sub": True})
             conn.close()
         except Exception as e:
@@ -3299,16 +4172,32 @@ class InvoiceBuilder:
         except Exception:
             return default
 
+    @staticmethod
+    def _title_band(p, right_title, right_sub, left_lines):
+        """سربرگ رنگی/خاکستری سند"""
+        left = "".join(f"<div>{ln}</div>" for ln in left_lines if ln)
+        right = ""
+        return (
+            f"<table width='100%' style='border-collapse:collapse;'>"
+            f"<tr style='background-color:{p['head_bg']};'>"
+            f"{InvoiceBuilder._rev([
+                InvoiceBuilder._td(right_title + right_sub, align='center',
+                                   size='10pt', color=p['head_fg'], bold=True),
+                InvoiceBuilder._td(left, align='left', size='7pt', color=p['head_fg']),
+            ])}"
+            f"</tr></table>")
+
     # ============================================================
     # ================  فاکتور عروس و داماد  =====================
     # ============================================================
     @staticmethod
-    def build_wedding_invoice(contract_id, with_details=True):
+    def build_wedding_invoice(contract_id, with_details=True, with_staff=True, mono=False):
+        p = doc_palette(mono)
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("""SELECT id, code, groom_name, bride_name, groom_phone, bride_phone,
                           contract_date, ceremony_date, selected_items, total_amount,
-                          discount, paid_amount, description, items_detail, staff_ids
+                          discount, paid_amount, description, items_detail, staff_ids, venue
                           FROM wedding_contracts WHERE id=?""", (contract_id,))
         c = cursor.fetchone()
 
@@ -3330,6 +4219,7 @@ class InvoiceBuilder:
         date_str = now.strftime("%Y/%m/%d")
         time_str = now.strftime("%H:%M")
         invoice_code = f"INV-{c[0]:05d}"
+        venue = c[15] if len(c) > 15 else ""
 
         items_list = [x.strip() for x in (c[8].split(',') if c[8] else []) if x.strip()]
         items_detail = InvoiceBuilder._safe_json(c[13], {})
@@ -3337,53 +4227,66 @@ class InvoiceBuilder:
 
         rows = InvoiceBuilder._items_breakdown(items_list, items_detail, with_details)
 
-        # ---------- سطرهای مفاد ----------
-        items_rows = ""
+        # ---------- سربرگ ----------
+        header = InvoiceBuilder._title_band(
+            p,
+            studio_name,
+            "<div style='font-size:9pt;'>فاکتور فروش خدمات فیلم و عکس</div>",
+            [f"تاریخ: {date_str}   ساعت: {time_str}",
+             f"فاکتور: {invoice_code}",
+             f"قرارداد: {c[1] or '-'}"],
+        )
+
+        # ---------- اطلاعات مشتری ----------
+        info_rows = (
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>صورتحساب آقای / خانم:</b>", align="right",
+                                   bg=p["box_bg"], size="8pt", width="26%"),
+                InvoiceBuilder._td(f"{c[2]} و {c[3]}", align="right", size="8pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>تلفن همراه:</b>", align="right",
+                                   bg=p["box_bg"], size="8pt", width="26%"),
+                InvoiceBuilder._td(f"{c[4] or '-'}   |   {c[5] or '-'}", align="right", size="8pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>تاریخ قرارداد:</b>", align="right",
+                                   bg=p["box_bg"], size="8pt", width="26%"),
+                InvoiceBuilder._td(f"{c[6] or '-'}", align="right", size="8pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>تاریخ مراسم:</b>", align="right",
+                                   bg=p["box_bg"], size="8pt", width="26%"),
+                InvoiceBuilder._td(f"{c[7] or '-'}", align="right", size="8pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>مکان مراسم:</b>", align="right",
+                                   bg=p["box_bg"], size="8pt", width="26%"),
+                InvoiceBuilder._td(f"{venue or '-'}", align="right", size="8pt"),
+            ])
+        )
+        info_table = (f"<table width='100%' style='border-collapse:collapse; "
+                      f"margin-top:3px;'>{info_rows}</table>")
+
+        # ---------- مفاد ----------
+        body_rows = ""
         for r in rows:
-            style = "background-color:#f4f8fd;" if r["sub"] else ""
-            name_style = "padding:6px 6px 6px 22px; color:#4a5c6e;" if r["sub"] else "padding:6px;"
-            items_rows += f"""
-            <tr style="{style}">
-                <td style="border:1px solid #9bb0c4; padding:6px; text-align:center;">{r['idx']}</td>
-                <td style="border:1px solid #9bb0c4; padding:6px; text-align:center; font-size:9pt;">{r['code']}</td>
-                <td style="border:1px solid #9bb0c4; {name_style}">{r['name']}</td>
-                <td style="border:1px solid #9bb0c4; padding:6px; text-align:center;">1</td>
-                <td style="border:1px solid #9bb0c4; padding:6px; text-align:center;">{r['price']:,}</td>
-                <td style="border:1px solid #9bb0c4; padding:6px; text-align:center;">{r['price']:,}</td>
-            </tr>"""
-        if not items_rows:
-            items_rows = ("<tr><td colspan='6' style='border:1px solid #9bb0c4; padding:8px; "
-                          "text-align:center;'>موردی ثبت نشده است</td></tr>")
+            bg = p["alt_row"] if r["sub"] else None
+            body_rows += InvoiceBuilder._row([
+                InvoiceBuilder._td(str(r['idx']), bg=bg, size="7.5pt"),
+                InvoiceBuilder._td(r['code'], bg=bg, size="7pt"),
+                InvoiceBuilder._td(r['name'], align="right", bg=bg, size="7.5pt"),
+                InvoiceBuilder._td("1", bg=bg, size="7.5pt"),
+                InvoiceBuilder._td(f"{r['price']:,}", bg=bg, size="7.5pt"),
+                InvoiceBuilder._td(f"{r['price']:,}", bg=bg, size="7.5pt"),
+            ])
+        if not body_rows:
+            body_rows = (f"<tr>{InvoiceBuilder._td('موردی ثبت نشده است', colspan=6, size='8pt')}</tr>")
 
-        # ---------- بیعانه‌ها ----------
-        deposits_rows = ""
-        for idx, (amt, dt, bank) in enumerate(deposits):
-            deposits_rows += f"""
-            <tr>
-                <td style="border:1px solid #9bb0c4; padding:5px; text-align:center;">{idx+1}</td>
-                <td style="border:1px solid #9bb0c4; padding:5px; text-align:center;">{amt:,}</td>
-                <td style="border:1px solid #9bb0c4; padding:5px; text-align:center;">{dt or '-'}</td>
-                <td style="border:1px solid #9bb0c4; padding:5px; text-align:center;">{bank or '-'}</td>
-            </tr>"""
-
-        # ---------- چک‌های مرتبط با همین قرارداد ----------
-        recv_rows = ""
-        paid_rows = ""
-        for chk in checks:
-            status = "پاس شده ✅" if chk[4] else "پاس نشده ⏳"
-            tr = f"""
-            <tr>
-                <td style="border:1px solid #9bb0c4; padding:5px; text-align:center;">{chk[0]}</td>
-                <td style="border:1px solid #9bb0c4; padding:5px; text-align:center;">{chk[1] or '-'}</td>
-                <td style="border:1px solid #9bb0c4; padding:5px; text-align:center;">{chk[2]:,}</td>
-                <td style="border:1px solid #9bb0c4; padding:5px; text-align:center;">{chk[3] or '-'}</td>
-                <td style="border:1px solid #9bb0c4; padding:5px; text-align:center;">{chk[5] or '-'}</td>
-                <td style="border:1px solid #9bb0c4; padding:5px; text-align:center;">{status}</td>
-            </tr>"""
-            if (chk[6] or "دریافتی") == "دریافتی":
-                recv_rows += tr
-            else:
-                paid_rows += tr
+        items_table = (
+            f"<table width='100%' style='border-collapse:collapse; margin-top:4px;'>"
+            f"<thead>{InvoiceBuilder._head(['ردیف', 'کد', 'شرح خدمات / پکیج', 'تعداد', 'بهای واحد (تومان)', 'مبلغ کل (تومان)'], bg=p['table_head'], fg=p['table_head_fg'])}</thead>"
+            f"<tbody>{body_rows}</tbody></table>")
 
         # ---------- محاسبات ----------
         raw_total = c[9] or 0
@@ -3394,201 +4297,160 @@ class InvoiceBuilder:
         words_net = number_to_persian_words(net_total)
         words_remain = number_to_persian_words(remain)
 
-        # ---------- نیروی کار قرارداد ----------
-        staff_rows = ""
-        staff_sum = 0
-        for i, m in enumerate(staff_list):
-            w = int(m.get("wage") or 0)
-            staff_sum += w
-            staff_rows += f"""
-            <tr>
-                <td style="border:1px solid #9bb0c4; padding:5px; text-align:center;">{i+1}</td>
-                <td style="border:1px solid #9bb0c4; padding:5px;">{m.get('name','-')}</td>
-                <td style="border:1px solid #9bb0c4; padding:5px; text-align:center;">{m.get('role','-')}</td>
-                <td style="border:1px solid #9bb0c4; padding:5px; text-align:center;">{w:,}</td>
-            </tr>"""
+        total_rows = (
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("جمع کل (قیمت خام)", align="right", bg=p["box_bg"], size="8pt"),
+                InvoiceBuilder._td(f"{raw_total:,}", align="center", size="8pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("تخفیف", align="right", bg=p["box_bg"], size="8pt"),
+                InvoiceBuilder._td(f"{discount:,}", align="center", size="8pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>جمع کل بعد از تخفیف</b>", align="right",
+                                   bg=p["alt_row"], size="8.5pt", bold=True),
+                InvoiceBuilder._td(f"<b>{net_total:,}</b>", align="center", size="8.5pt", bold=True),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("جمع بیعانه‌های دریافتی", align="right", bg=p["box_bg"], size="8pt"),
+                InvoiceBuilder._td(f"{paid:,}", align="center", size="8pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>مانده قابل پرداخت</b>", align="right",
+                                   bg=p["total_bg"], size="9pt", bold=True),
+                InvoiceBuilder._td(f"<b>{remain:,}</b>", align="center", size="9pt", bold=True),
+            ])
+        )
+        totals_table = f"<table width='100%' style='border-collapse:collapse;'>{total_rows}</table>"
 
-        detail_caption = "با ریز پکیج (زیرمجموعه‌ها)" if with_details else "بدون ریز پکیج"
+        words_cell = (
+            f"<div style='font-size:8pt;'><b>مبلغ کل به حروف:</b> {words_net} تومان</div>"
+            f"<div style='font-size:8pt; margin-top:2px;'><b>مانده به حروف:</b> {words_remain} تومان</div>"
+            f"<div style='font-size:7.5pt; margin-top:4px; color:{p['muted']};'>"
+            f"<b>توضیحات:</b> {c[12] if c[12] else 'ندارد'}</div>"
+        )
+        calc_table = (
+            f"<table width='100%' style='border-collapse:collapse; margin-top:4px;'>"
+            f"{InvoiceBuilder._row([InvoiceBuilder._td(words_cell, align='right', size='8pt'), totals_table])}"
+            f"</table>")
+
+        # ---------- بیعانه‌ها (فقط اگر وجود داشته باشد) ----------
+        deposits_block = ""
+        if deposits:
+            dep_rows = ""
+            for idx, (amt, dt, bank) in enumerate(deposits):
+                dep_rows += InvoiceBuilder._row([
+                    InvoiceBuilder._td(str(idx + 1), size="7.5pt"),
+                    InvoiceBuilder._td(f"{amt:,}", size="7.5pt"),
+                    InvoiceBuilder._td(dt or "-", size="7.5pt"),
+                    InvoiceBuilder._td(bank or "-", size="7.5pt"),
+                ])
+            deposits_block = (
+                f"<div style='margin-top:5px; font-size:8.5pt; font-weight:bold; color:{p['accent']};'>"
+                f"بیعانه‌ها و پرداخت‌های دریافتی</div>"
+                f"<table width='100%' style='border-collapse:collapse;'>"
+                f"<thead>{InvoiceBuilder._head(['ردیف', 'مبلغ (تومان)', 'تاریخ', 'بانک'], bg=p['table_head'], fg=p['table_head_fg'])}</thead>"
+                f"<tbody>{dep_rows}</tbody></table>")
+
+        # ---------- چک‌ها: فقط بخشی که چک دارد چاپ می‌شود ----------
+        # اگر هیچ چک دریافتی یا پرداختی وجود نداشته باشد، آن بخش چاپ نمی‌شود.
+        recv_rows = ""
+        paid_rows = ""
+        ri = pi = 0
+        for chk in checks:
+            status = "پاس شده" if chk[4] else "پاس نشده"
+            if (chk[6] or "دریافتی") == "دریافتی":
+                ri += 1
+                recv_rows += InvoiceBuilder._row([
+                    InvoiceBuilder._td(str(ri), size="7pt"),
+                    InvoiceBuilder._td(chk[0], size="7pt"),
+                    InvoiceBuilder._td(chk[1] or "-", size="7pt"),
+                    InvoiceBuilder._td(f"{chk[2]:,}", size="7pt"),
+                    InvoiceBuilder._td(chk[3] or "-", size="7pt"),
+                    InvoiceBuilder._td(chk[5] or "-", size="7pt"),
+                    InvoiceBuilder._td(status, size="7pt"),
+                ])
+            else:
+                pi += 1
+                paid_rows += InvoiceBuilder._row([
+                    InvoiceBuilder._td(str(pi), size="7pt"),
+                    InvoiceBuilder._td(chk[0], size="7pt"),
+                    InvoiceBuilder._td(chk[1] or "-", size="7pt"),
+                    InvoiceBuilder._td(f"{chk[2]:,}", size="7pt"),
+                    InvoiceBuilder._td(chk[3] or "-", size="7pt"),
+                    InvoiceBuilder._td(chk[5] or "-", size="7pt"),
+                    InvoiceBuilder._td(status, size="7pt"),
+                ])
+
+        checks_block = ""
+        if recv_rows or paid_rows:
+            checks_block = (
+                f"<div style='margin-top:5px; font-size:8.5pt; font-weight:bold; "
+                f"color:{p['accent']};'>چک‌های مرتبط با این قرارداد</div>")
+            if recv_rows:
+                checks_block += (
+                    f"<table width='100%' style='border-collapse:collapse;'>"
+                    f"<thead>"
+                    f"<tr style='background-color:{p['recv_head']};'>"
+                    f"{InvoiceBuilder._rev([InvoiceBuilder._td('<b>چک‌های دریافتی (دریافتی از)</b>', align='center', colspan=7, color='#ffffff', size='8pt', bold=True)])}"
+                    f"</tr>"
+                    f"{InvoiceBuilder._head(['ردیف', 'شماره چک', 'بانک', 'مبلغ (تومان)', 'سررسید', 'دریافتی از', 'وضعیت'], bg=p['recv_head'], fg='#ffffff')}"
+                    f"</thead><tbody>{recv_rows}</tbody></table>")
+            if paid_rows:
+                checks_block += (
+                    f"<table width='100%' style='border-collapse:collapse; margin-top:2px;'>"
+                    f"<thead>"
+                    f"<tr style='background-color:{p['paid_head']};'>"
+                    f"{InvoiceBuilder._rev([InvoiceBuilder._td('<b>چک‌های پرداختی (در وجه)</b>', align='center', colspan=7, color='#ffffff', size='8pt', bold=True)])}"
+                    f"</tr>"
+                    f"{InvoiceBuilder._head(['ردیف', 'شماره چک', 'بانک', 'مبلغ (تومان)', 'سررسید', 'در وجه', 'وضعیت'], bg=p['paid_head'], fg='#ffffff')}"
+                    f"</thead><tbody>{paid_rows}</tbody></table>")
+
+        # ---------- نیروی کار (اختیاری) ----------
+        staff_block = ""
+        if with_staff and staff_list:
+            staff_rows = ""
+            staff_sum = 0
+            for i, m in enumerate(staff_list):
+                w = int(m.get("wage") or 0)
+                staff_sum += w
+                staff_rows += InvoiceBuilder._row([
+                    InvoiceBuilder._td(str(i + 1), size="7.5pt"),
+                    InvoiceBuilder._td(m.get('name', '-'), align="right", size="7.5pt"),
+                    InvoiceBuilder._td(m.get('role', '-'), size="7.5pt"),
+                    InvoiceBuilder._td(f"{w:,}", size="7.5pt"),
+                ])
+            staff_rows += InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>جمع حقوق نیروی کار</b>", align="right",
+                                   colspan=3, bg=p["alt_row"], size="8pt", bold=True),
+                InvoiceBuilder._td(f"<b>{staff_sum:,}</b>", bg=p["alt_row"], size="8pt", bold=True),
+            ])
+            staff_block = (
+                f"<div style='margin-top:5px; font-size:8.5pt; font-weight:bold; color:{p['accent']};'>"
+                f"نیروی کار این قرارداد</div>"
+                f"<table width='100%' style='border-collapse:collapse;'>"
+                f"<thead>{InvoiceBuilder._head(['ردیف', 'نام', 'نقش', 'حقوق این قرارداد (تومان)'], bg=p['staff_head'], fg='#ffffff')}</thead>"
+                f"<tbody>{staff_rows}</tbody></table>")
 
         html = f"""
-        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:10pt;">
-          <table width="100%"  style="border-collapse:collapse">
-            <tr style="background-color:#1F4E78;">
-              <td style="padding:14px; text-align:center; color:#ffffff;">
-                <div style="font-size:22pt; font-weight:bold;">{studio_name}</div>
-                <div style="font-size:12pt;">فاکتور فروش خدمات فیلم و عکس</div>
-              </td>
-              <td width="32%"  style="padding:14px;color:#ffffff;font-size:9pt;text-align:left">
-                <div>تاریخ صدور: {date_str}</div>
-                <div>ساعت: {time_str}</div>
-                <div>کد فاکتور: {invoice_code}</div>
-                <div>کد قرارداد: {c[1] or '-'}</div>
-                <div>نوع چاپ: {detail_caption}</div>
-              </td>
-            </tr>
-          </table>
-
-          <table width="100%"  style="border-collapse:collapse;margin-top:10px">
+        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:9pt;">
+          {header}
+          {info_table}
+          {items_table}
+          {calc_table}
+          {deposits_block}
+          {checks_block}
+          {staff_block}
+          <table width="100%" style="border-collapse:collapse; margin-top:14px;">
             <tr>
-              <td width="50%"  style="border:1px solid #9bb0c4;padding:7px;background-color:#eef5fc">
-                <b>صورتحساب آقای / خانم:</b> {c[2]} و {c[3]}
-              </td>
-              <td style="border:1px solid #9bb0c4; padding:7px; background-color:#eef5fc;">
-                <b>تلفن همراه:</b> {c[4] or '-'} &nbsp;|&nbsp; {c[5] or '-'}
-              </td>
-            </tr>
-            <tr>
-              <td style="border:1px solid #9bb0c4; padding:7px;">
-                <b>تاریخ قرارداد:</b> {c[6] or '-'}
-              </td>
-              <td style="border:1px solid #9bb0c4; padding:7px;">
-                <b>تاریخ مراسم:</b> {c[7] or '-'}
-              </td>
+              {InvoiceBuilder._rev([
+                InvoiceBuilder._td("مهر و امضای مشتری", align="center", size="8.5pt"),
+                InvoiceBuilder._td("مهر و امضای استودیو", align="center", size="8.5pt"),
+              ])}
             </tr>
           </table>
-
-          <table width="100%"  style="border-collapse:collapse;margin-top:12px;font-size:9pt">
-            <thead>
-              <tr style="background-color:#2C6699; color:#ffffff;">
-                <th width="6%"  style="border:1px solid #9bb0c4;padding:7px">ردیف</th>
-                <th width="12%"  style="border:1px solid #9bb0c4;padding:7px">کد</th>
-                <th style="border:1px solid #9bb0c4; padding:7px;">شرح خدمات / پکیج</th>
-                <th width="8%"  style="border:1px solid #9bb0c4;padding:7px">تعداد</th>
-                <th width="15%"  style="border:1px solid #9bb0c4;padding:7px">بهای واحد (تومان)</th>
-                <th width="16%"  style="border:1px solid #9bb0c4;padding:7px">مبلغ کل (تومان)</th>
-              </tr>
-            </thead>
-            <tbody>{items_rows}</tbody>
-          </table>
-
-          <table width="100%"  style="border-collapse:collapse;margin-top:12px">
-            <tr>
-              <td width="58%"  style="border:1px solid #9bb0c4;padding:10px;vertical-align:top">
-                <div style="font-size:10pt;"><b>مبلغ کل به حروف:</b> {words_net} تومان</div>
-                <div style="font-size:10pt; margin-top:6px;"><b>مانده به حروف:</b> {words_remain} تومان</div>
-                <div style="margin-top:10px; font-size:9pt; color:#4a5c6e;">
-                  <b>توضیحات:</b> {c[12] if c[12] else 'ندارد'}
-                </div>
-                <div style="margin-top:8px; font-size:8pt; color:#7f8c8d;">
-                  {studio_address if studio_address else ''}
-                </div>
-              </td>
-              <td style="border:1px solid #9bb0c4; padding:0; vertical-align:top;">
-                <table width="100%"  style="border-collapse:collapse;font-size:10pt">
-                  <tr style="background-color:#eef5fc;">
-                    <td style="padding:8px; border-bottom:1px solid #9bb0c4;">جمع کل (قیمت خام)</td>
-                    <td style="padding:8px; border-bottom:1px solid #9bb0c4; text-align:left;">{raw_total:,}</td>
-                  </tr>
-                  <tr>
-                    <td style="padding:8px; border-bottom:1px solid #9bb0c4;">تخفیف</td>
-                    <td style="padding:8px; border-bottom:1px solid #9bb0c4; text-align:left;">{discount:,}</td>
-                  </tr>
-                  <tr style="background-color:#dcecfb;">
-                    <td style="padding:8px; border-bottom:1px solid #9bb0c4;"><b>جمع کل بعد از تخفیف</b></td>
-                    <td style="padding:8px; border-bottom:1px solid #9bb0c4; text-align:left;"><b>{net_total:,}</b></td>
-                  </tr>
-                  <tr>
-                    <td style="padding:8px; border-bottom:1px solid #9bb0c4;">جمع بیعانه‌های دریافتی</td>
-                    <td style="padding:8px; border-bottom:1px solid #9bb0c4; text-align:left;">{paid:,}</td>
-                  </tr>
-                  <tr style="background-color:#ffe9a8;">
-                    <td style="padding:9px;"><b>مانده قابل پرداخت</b></td>
-                    <td style="padding:9px; text-align:left;"><b>{remain:,}</b></td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
-          </table>
-
-          <div style="margin-top:14px; font-size:11pt; font-weight:bold; color:#1F4E78;">
-            بیعانه‌ها و پرداخت‌های دریافتی
-          </div>
-          <table width="100%"  style="border-collapse:collapse;font-size:9pt;margin-top:4px">
-            <thead>
-              <tr style="background-color:#2C6699; color:#ffffff;">
-                <th width="8%"  style="border:1px solid #9bb0c4;padding:6px">ردیف</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">مبلغ (تومان)</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">تاریخ</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">بانک</th>
-              </tr>
-            </thead>
-            <tbody>
-              {deposits_rows if deposits_rows else "<tr><td colspan='4' style='border:1px solid #9bb0c4; padding:6px; text-align:center;'>بیعانه‌ای ثبت نشده است</td></tr>"}
-            </tbody>
-          </table>
-
-          <div style="margin-top:14px; font-size:11pt; font-weight:bold; color:#1F4E78;">
-            چک‌های مرتبط با این قرارداد
-          </div>
-          <table width="100%"  style="border-collapse:collapse;font-size:9pt;margin-top:4px">
-            <thead>
-              <tr style="background-color:#1e8449; color:#ffffff;">
-                <th colspan="6" style="border:1px solid #9bb0c4; padding:6px;">چک‌های دریافتی</th>
-              </tr>
-              <tr style="background-color:#eafaf1;">
-                <th style="border:1px solid #9bb0c4; padding:5px;">شماره چک</th>
-                <th style="border:1px solid #9bb0c4; padding:5px;">بانک</th>
-                <th style="border:1px solid #9bb0c4; padding:5px;">مبلغ (تومان)</th>
-                <th style="border:1px solid #9bb0c4; padding:5px;">سررسید</th>
-                <th style="border:1px solid #9bb0c4; padding:5px;">دریافتی از</th>
-                <th style="border:1px solid #9bb0c4; padding:5px;">وضعیت</th>
-              </tr>
-            </thead>
-            <tbody>
-              {recv_rows if recv_rows else "<tr><td colspan='6' style='border:1px solid #9bb0c4; padding:6px; text-align:center;'>چک دریافتی ثبت نشده است</td></tr>"}
-            </tbody>
-          </table>
-
-          <table width="100%"  style="border-collapse:collapse;font-size:9pt;margin-top:8px">
-            <thead>
-              <tr style="background-color:#a93226; color:#ffffff;">
-                <th colspan="6" style="border:1px solid #9bb0c4; padding:6px;">چک‌های پرداختی</th>
-              </tr>
-              <tr style="background-color:#fdedec;">
-                <th style="border:1px solid #9bb0c4; padding:5px;">شماره چک</th>
-                <th style="border:1px solid #9bb0c4; padding:5px;">بانک</th>
-                <th style="border:1px solid #9bb0c4; padding:5px;">مبلغ (تومان)</th>
-                <th style="border:1px solid #9bb0c4; padding:5px;">سررسید</th>
-                <th style="border:1px solid #9bb0c4; padding:5px;">در وجه</th>
-                <th style="border:1px solid #9bb0c4; padding:5px;">وضعیت</th>
-              </tr>
-            </thead>
-            <tbody>
-              {paid_rows if paid_rows else "<tr><td colspan='6' style='border:1px solid #9bb0c4; padding:6px; text-align:center;'>چک پرداختی ثبت نشده است</td></tr>"}
-            </tbody>
-          </table>
-
-          {"" if not staff_rows else f'''
-          <div style="margin-top:14px; font-size:11pt; font-weight:bold; color:#1F4E78;">
-            نیروی کار این قرارداد
-          </div>
-          <table width="100%"  style="border-collapse:collapse;font-size:9pt;margin-top:4px">
-            <thead>
-              <tr style="background-color:#5b2c8e; color:#ffffff;">
-                <th width="8%"  style="border:1px solid #9bb0c4;padding:6px">ردیف</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">نام</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">نقش</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">حقوق این قرارداد (تومان)</th>
-              </tr>
-            </thead>
-            <tbody>{staff_rows}
-              <tr style="background-color:#f3ecfb;">
-                <td colspan="3" style="border:1px solid #9bb0c4; padding:6px; text-align:left;"><b>جمع حقوق نیروی کار</b></td>
-                <td style="border:1px solid #9bb0c4; padding:6px; text-align:center;"><b>{staff_sum:,}</b></td>
-              </tr>
-            </tbody>
-          </table>'''}
-
-          <table width="100%"  style="margin-top:26px;font-size:10pt">
-            <tr>
-              <td width="50%"  style="text-align:center;padding:14px">مهر و امضای مشتری</td>
-              <td width="50%"  style="text-align:center;padding:14px">مهر و امضای استودیو</td>
-            </tr>
-          </table>
-
-          <div style="text-align:center; margin-top:16px; font-size:8pt; color:#7f8c8d; border-top:1px solid #cfdbe8; padding-top:8px;">
-            {studio_name} &nbsp;|&nbsp; تلفن: {studio_phone}
-            {('&nbsp;|&nbsp; ' + studio_address) if studio_address else ''}
+          <div style="text-align:center; margin-top:6px; font-size:7pt; color:{p['muted']};">
+            {studio_name} | تلفن: {studio_phone}{(' | ' + studio_address) if studio_address else ''}
           </div>
         </div>
         """
@@ -3599,7 +4461,8 @@ class InvoiceBuilder:
     # ==============  فاکتور پروژه‌های تبلیغاتی  ==================
     # ============================================================
     @staticmethod
-    def build_commercial_invoice(project_id):
+    def build_commercial_invoice(project_id, with_details=True, with_staff=False, mono=False):
+        p = doc_palette(mono)
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("""SELECT id, code, title, project_type, camera_count, total_amount,
@@ -3617,95 +4480,88 @@ class InvoiceBuilder:
         paid = c[6] or 0
         remain = max(0, total - paid)
 
+        header = InvoiceBuilder._title_band(
+            p, studio_name,
+            f"<div style='font-size:9pt;'>فاکتور پروژه {c[3]}</div>",
+            [f"تاریخ: {now.strftime('%Y/%m/%d')}   ساعت: {now.strftime('%H:%M')}",
+             f"فاکتور: {invoice_code}", f"پروژه: {c[1] or '-'}"])
+
+        info_rows = (
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>صورتحساب آقای / خانم:</b>", align="right",
+                                   bg=p["box_bg"], size="8pt", width="26%"),
+                InvoiceBuilder._td(f"{c[9] or '-'}", align="right", size="8pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>تلفن همراه:</b>", align="right",
+                                   bg=p["box_bg"], size="8pt", width="26%"),
+                InvoiceBuilder._td(f"{c[10] or '-'}", align="right", size="8pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>تاریخ پروژه:</b>", align="right",
+                                   bg=p["box_bg"], size="8pt", width="26%"),
+                InvoiceBuilder._td(f"{c[7] or '-'}", align="right", size="8pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>تعداد دوربین:</b>", align="right",
+                                   bg=p["box_bg"], size="8pt", width="26%"),
+                InvoiceBuilder._td(f"{c[4]}", align="right", size="8pt"),
+            ])
+        )
+        items_rows = InvoiceBuilder._row([
+            InvoiceBuilder._td("1", size="8pt"),
+            InvoiceBuilder._td("-", size="8pt"),
+            InvoiceBuilder._td(c[2], align="right", size="8pt"),
+            InvoiceBuilder._td("1", size="8pt"),
+            InvoiceBuilder._td(f"{total:,}", size="8pt"),
+            InvoiceBuilder._td(f"{total:,}", size="8pt"),
+        ])
+        totals = (
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("جمع کل", align="right", bg=p["box_bg"], size="8.5pt"),
+                InvoiceBuilder._td(f"{total:,}", size="8.5pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("پرداختی", align="right", bg=p["box_bg"], size="8.5pt"),
+                InvoiceBuilder._td(f"{paid:,}", size="8.5pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>مانده قابل پرداخت</b>", align="right",
+                                   bg=p["total_bg"], size="9pt", bold=True),
+                InvoiceBuilder._td(f"<b>{remain:,}</b>", size="9pt", bold=True),
+            ])
+        )
+        words = (
+            f"<div style='font-size:8pt;'><b>مبلغ کل به حروف:</b> "
+            f"{number_to_persian_words(total)} تومان</div>"
+            f"<div style='font-size:8pt; margin-top:2px;'><b>مانده به حروف:</b> "
+            f"{number_to_persian_words(remain)} تومان</div>"
+            f"<div style='font-size:7.5pt; margin-top:4px; color:{p['muted']};'>"
+            f"<b>توضیحات:</b> {c[8] if c[8] else 'ندارد'}</div>"
+        )
+
         html = f"""
-        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:10pt;">
-          <table width="100%"  style="border-collapse:collapse">
-            <tr style="background-color:#1e8449;">
-              <td style="padding:14px; text-align:center; color:#ffffff;">
-                <div style="font-size:22pt; font-weight:bold;">{studio_name}</div>
-                <div style="font-size:12pt;">فاکتور پروژه {c[3]}</div>
-              </td>
-              <td width="32%"  style="padding:14px;color:#ffffff;font-size:9pt;text-align:left">
-                <div>تاریخ صدور: {now.strftime('%Y/%m/%d')}</div>
-                <div>ساعت: {now.strftime('%H:%M')}</div>
-                <div>کد فاکتور: {invoice_code}</div>
-                <div>کد پروژه: {c[1] or '-'}</div>
-              </td>
-            </tr>
+        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:9pt;">
+          {header}
+          <table width="100%" style="border-collapse:collapse; margin-top:3px;">{info_rows}</table>
+          <table width="100%" style="border-collapse:collapse; margin-top:4px;">
+            <thead>{InvoiceBuilder._head(['ردیف', 'کد', 'عنوان خدمات', 'تعداد', 'بهای واحد (تومان)', 'مبلغ کل (تومان)'], bg=p['table_head'], fg=p['table_head_fg'])}</thead>
+            <tbody>{items_rows}</tbody>
           </table>
-
-          <table width="100%"  style="border-collapse:collapse;margin-top:10px">
+          <table width="100%" style="border-collapse:collapse; margin-top:4px;">
+            {InvoiceBuilder._row([InvoiceBuilder._td(words, align='right', size='8pt'),
+                                  f"<table width='100%' style='border-collapse:collapse;'>{totals}</table>"])}
+          </table>
+          <table width="100%" style="border-collapse:collapse; margin-top:14px;">
             <tr>
-              <td width="50%"  style="border:1px solid #9bb0c4;padding:7px;background-color:#eefaf3">
-                <b>صورتحساب آقای / خانم:</b> {c[9] or '-'}
-              </td>
-              <td style="border:1px solid #9bb0c4; padding:7px; background-color:#eefaf3;">
-                <b>تلفن همراه:</b> {c[10] or '-'}
-              </td>
-            </tr>
-            <tr>
-              <td style="border:1px solid #9bb0c4; padding:7px;"><b>تاریخ پروژه:</b> {c[7] or '-'}</td>
-              <td style="border:1px solid #9bb0c4; padding:7px;"><b>تعداد دوربین:</b> {c[4]}</td>
+              {InvoiceBuilder._rev([
+                InvoiceBuilder._td("مهر و امضای مشتری", align="center", size="8.5pt"),
+                InvoiceBuilder._td("مهر و امضای استودیو", align="center", size="8.5pt"),
+              ])}
             </tr>
           </table>
-
-          <table width="100%"  style="border-collapse:collapse;margin-top:12px;font-size:9pt">
-            <thead>
-              <tr style="background-color:#2C6699; color:#ffffff;">
-                <th width="8%"  style="border:1px solid #9bb0c4;padding:7px">ردیف</th>
-                <th style="border:1px solid #9bb0c4; padding:7px;">عنوان خدمات</th>
-                <th width="10%"  style="border:1px solid #9bb0c4;padding:7px">تعداد</th>
-                <th width="20%"  style="border:1px solid #9bb0c4;padding:7px">مبلغ کل (تومان)</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td style="border:1px solid #9bb0c4; padding:7px; text-align:center;">1</td>
-                <td style="border:1px solid #9bb0c4; padding:7px;">{c[2]}</td>
-                <td style="border:1px solid #9bb0c4; padding:7px; text-align:center;">1</td>
-                <td style="border:1px solid #9bb0c4; padding:7px; text-align:center;">{total:,}</td>
-              </tr>
-            </tbody>
-          </table>
-
-          <table width="100%"  style="border-collapse:collapse;margin-top:12px">
-            <tr>
-              <td width="58%"  style="border:1px solid #9bb0c4;padding:10px;vertical-align:top">
-                <div style="font-size:10pt;"><b>مبلغ کل به حروف:</b> {number_to_persian_words(total)} تومان</div>
-                <div style="font-size:10pt; margin-top:6px;"><b>مانده به حروف:</b> {number_to_persian_words(remain)} تومان</div>
-                <div style="margin-top:10px; font-size:9pt; color:#4a5c6e;">
-                  <b>توضیحات:</b> {c[8] if c[8] else 'ندارد'}
-                </div>
-              </td>
-              <td style="border:1px solid #9bb0c4; padding:0; vertical-align:top;">
-                <table width="100%"  style="border-collapse:collapse;font-size:10pt">
-                  <tr style="background-color:#eefaf3;">
-                    <td style="padding:8px; border-bottom:1px solid #9bb0c4;">جمع کل</td>
-                    <td style="padding:8px; border-bottom:1px solid #9bb0c4; text-align:left;">{total:,}</td>
-                  </tr>
-                  <tr>
-                    <td style="padding:8px; border-bottom:1px solid #9bb0c4;">پرداختی</td>
-                    <td style="padding:8px; border-bottom:1px solid #9bb0c4; text-align:left;">{paid:,}</td>
-                  </tr>
-                  <tr style="background-color:#ffe9a8;">
-                    <td style="padding:9px;"><b>مانده قابل پرداخت</b></td>
-                    <td style="padding:9px; text-align:left;"><b>{remain:,}</b></td>
-                  </tr>
-                </table>
-              </td>
-            </tr>
-          </table>
-
-          <table width="100%"  style="margin-top:26px;font-size:10pt">
-            <tr>
-              <td width="50%"  style="text-align:center;padding:14px">مهر و امضای مشتری</td>
-              <td width="50%"  style="text-align:center;padding:14px">مهر و امضای استودیو</td>
-            </tr>
-          </table>
-
-          <div style="text-align:center; margin-top:16px; font-size:8pt; color:#7f8c8d; border-top:1px solid #cfdbe8; padding-top:8px;">
-            {studio_name} &nbsp;|&nbsp; تلفن: {studio_phone}
-            {('&nbsp;|&nbsp; ' + studio_address) if studio_address else ''}
+          <div style="text-align:center; margin-top:6px; font-size:7pt; color:{p['muted']};">
+            {studio_name} | تلفن: {studio_phone}{(' | ' + studio_address) if studio_address else ''}
           </div>
         </div>
         """
@@ -3716,7 +4572,8 @@ class InvoiceBuilder:
     # =====================  رسید وجه  ==========================
     # ============================================================
     @staticmethod
-    def build_receipt(name, amount, for_service, date_str, direction="دریافتی"):
+    def build_receipt(name, amount, for_service, date_str, direction="دریافتی", mono=False):
+        p = doc_palette(mono)
         studio_name, studio_phone, studio_address = InvoiceBuilder._studio_info()
         now = jdatetime.datetime.now()
         amount_words = number_to_persian_words(amount)
@@ -3730,71 +4587,57 @@ class InvoiceBuilder:
             party_label = "پرداخت شد به آقا / خانم"
             action = "از حساب استودیو پرداخت گردید."
 
+        # برچسب‌ها سمت راست و کادرهای پرکردنی سمت چپ (سلول اول = مقدار)
+        rows = (
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>" + party_label + ":</b>", align="right",
+                                   bg=p["box_bg"], size="9pt", width="46%"),
+                InvoiceBuilder._td(f"<b>{name}</b>", align="right", size="10pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>مبلغ (تومان):</b>", align="right",
+                                   bg=p["box_bg"], size="9pt", width="46%"),
+                InvoiceBuilder._td(f"<b>{amount:,}</b>", align="right", size="12pt", bold=True),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>مبلغ به حروف:</b>", align="right",
+                                   bg=p["box_bg"], size="9pt", width="46%"),
+                InvoiceBuilder._td(f"{amount_words} تومان", align="right", size="9pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>بابت:</b>", align="right",
+                                   bg=p["box_bg"], size="9pt", width="46%"),
+                InvoiceBuilder._td(for_service, align="right", size="9pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>شرح:</b>", align="right",
+                                   bg=p["box_bg"], size="9pt", width="46%"),
+                InvoiceBuilder._td(action, align="right", size="9pt"),
+            ])
+        )
+
         html = f"""
-        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:11pt;">
-          <table width="100%"  style="border-collapse:collapse">
-            <tr style="background-color:#1F4E78;">
-              <td style="padding:16px; text-align:center; color:#ffffff;">
-                <div style="font-size:24pt; font-weight:bold;">{studio_name}</div>
-                <div style="font-size:13pt;">{title}</div>
-              </td>
-              <td width="32%"  style="padding:16px;color:#ffffff;font-size:9pt;text-align:left">
-                <div>تاریخ: {date_str}</div>
-                <div>ساعت: {now.strftime('%H:%M')}</div>
-                <div>شماره رسید: RC-{now.strftime('%Y%m%d%H%M%S')}</div>
-              </td>
-            </tr>
-          </table>
-
-          <table width="100%"  style="border-collapse:collapse;margin-top:16px;font-size:11pt">
-            <tr>
-              <td width="34%"  style="border:1px solid #9bb0c4;background-color:#eef5fc;padding:10px">
-                <b>{party_label}:</b>
-              </td>
-              <td style="border:1px solid #9bb0c4; padding:10px;"><b>{name}</b></td>
-            </tr>
-            <tr>
-              <td style="border:1px solid #9bb0c4; background-color:#eef5fc; padding:10px;">
-                <b>مبلغ (تومان):</b>
-              </td>
-              <td style="border:1px solid #9bb0c4; padding:10px;">
-                <b style="font-size:13pt;">{amount:,}</b> تومان
-              </td>
-            </tr>
-            <tr>
-              <td style="border:1px solid #9bb0c4; background-color:#eef5fc; padding:10px;">
-                <b>مبلغ به حروف:</b>
-              </td>
-              <td style="border:1px solid #9bb0c4; padding:10px;">{amount_words} تومان</td>
-            </tr>
-            <tr>
-              <td style="border:1px solid #9bb0c4; background-color:#eef5fc; padding:10px;">
-                <b>بابت:</b>
-              </td>
-              <td style="border:1px solid #9bb0c4; padding:10px;">{for_service}</td>
-            </tr>
-            <tr>
-              <td style="border:1px solid #9bb0c4; background-color:#eef5fc; padding:10px;">
-                <b>شرح:</b>
-              </td>
-              <td style="border:1px solid #9bb0c4; padding:10px;">{action}</td>
-            </tr>
-          </table>
-
-          <div style="margin-top:18px; border:1px solid #e74c3c; background-color:#fdedec; padding:10px; font-size:10pt; color:#a93226;">
+        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:9pt;">
+          {InvoiceBuilder._title_band(
+              p, studio_name,
+              f"<div style='font-size:10pt;'>{title}</div>",
+              [f"تاریخ: {date_str}", f"ساعت: {now.strftime('%H:%M')}",
+               f"شماره رسید: RC-{now.strftime('%y%m%d%H%M')}"])}
+          <table width="100%" style="border-collapse:collapse; margin-top:6px;">{rows}</table>
+          <div style="margin-top:8px; border:1px solid {p['warn_border']}; background-color:{p['warn_bg']};
+                      padding:5px; font-size:8.5pt;">
             <b>توجه:</b> بیعانه پرداختی پس داده نمی‌شود.
           </div>
-
-          <table width="100%"  style="margin-top:70px;font-size:11pt">
+          <table width="100%" style="border-collapse:collapse; margin-top:40px;">
             <tr>
-              <td width="50%"  style="text-align:center">امضای حسابداری</td>
-              <td width="50%"  style="text-align:center">مهر استودیو</td>
+              {InvoiceBuilder._rev([
+                InvoiceBuilder._td("امضای حسابداری", align="center", size="9pt"),
+                InvoiceBuilder._td("مهر استودیو", align="center", size="9pt"),
+              ])}
             </tr>
           </table>
-
-          <div style="text-align:center; margin-top:30px; font-size:8pt; color:#7f8c8d; border-top:1px solid #cfdbe8; padding-top:8px;">
-            {studio_name} &nbsp;|&nbsp; تلفن: {studio_phone}
-            {('&nbsp;|&nbsp; ' + studio_address) if studio_address else ''}
+          <div style="text-align:center; margin-top:12px; font-size:7pt; color:{p['muted']};">
+            {studio_name} | تلفن: {studio_phone}{(' | ' + studio_address) if studio_address else ''}
           </div>
         </div>
         """
@@ -3804,18 +4647,17 @@ class InvoiceBuilder:
     # ==================  گزارش ریز کارکرد فرد  =================
     # ============================================================
     @staticmethod
-    def build_staff_report(person_id, period="ماهانه", year=None, month=None):
-        """گزارش ریز کارکرد یک فرد"""
+    def build_staff_report(person_id, period="ماهانه", year=None, month=None, mono=False):
+        p = doc_palette(mono)
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("SELECT code, name, role, phone FROM persons WHERE id=?", (person_id,))
-        p = cursor.fetchone()
-        if not p:
+        pr = cursor.fetchone()
+        if not pr:
             conn.close()
             return "", ""
 
         work_year = year or get_current_year()
-
         cursor.execute("""SELECT amount, year, month, day, description, category
                           FROM transactions WHERE person_id=? AND work_year=?
                           ORDER BY year DESC, month DESC, day DESC""",
@@ -3824,95 +4666,73 @@ class InvoiceBuilder:
         conn.close()
 
         total_salary = sum(t[0] for t in trans)
-
         trans_rows = ""
         for idx, t in enumerate(trans):
-            trans_rows += f"""
-            <tr>
-                <td style='border:1px solid #9bb0c4; padding:5px; text-align:center;'>{idx+1}</td>
-                <td style='border:1px solid #9bb0c4; padding:5px; text-align:center;'>{t[1]}/{t[2]:02d}/{t[3]:02d}</td>
-                <td style='border:1px solid #9bb0c4; padding:5px;'>{t[5]}</td>
-                <td style='border:1px solid #9bb0c4; padding:5px;'>{t[4] or '-'}</td>
-                <td style='border:1px solid #9bb0c4; padding:5px; text-align:center;'>{t[0]:,}</td>
-            </tr>"""
+            trans_rows += InvoiceBuilder._row([
+                InvoiceBuilder._td(str(idx + 1), size="7.5pt"),
+                InvoiceBuilder._td(f"{t[1]}/{t[2]:02d}/{t[3]:02d}", size="7.5pt"),
+                InvoiceBuilder._td(t[5], size="7.5pt"),
+                InvoiceBuilder._td(t[4] or "-", align="right", size="7.5pt"),
+                InvoiceBuilder._td(f"{t[0]:,}", size="7.5pt"),
+            ])
+        if not trans_rows:
+            trans_rows = f"<tr>{InvoiceBuilder._td('تراکنشی یافت نشد', colspan=5, size='8pt')}</tr>"
 
         studio_name, studio_phone, _addr = InvoiceBuilder._studio_info()
         now = jdatetime.datetime.now()
 
+        info_rows = (
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>کد پرسنل:</b>", align="right", bg=p["box_bg"], size="8.5pt", width="22%"),
+                InvoiceBuilder._td(pr[0] or "-", align="right", size="8.5pt"),
+                InvoiceBuilder._td("<b>نام و نام خانوادگی:</b>", align="right", bg=p["box_bg"], size="8.5pt", width="22%"),
+                InvoiceBuilder._td(pr[1], align="right", size="8.5pt"),
+            ]) +
+            InvoiceBuilder._row([
+                InvoiceBuilder._td("<b>نقش / تخصص:</b>", align="right", bg=p["box_bg"], size="8.5pt", width="22%"),
+                InvoiceBuilder._td(pr[2], align="right", size="8.5pt"),
+                InvoiceBuilder._td("<b>تلفن:</b>", align="right", bg=p["box_bg"], size="8.5pt", width="22%"),
+                InvoiceBuilder._td(pr[3] or "-", align="right", size="8.5pt"),
+            ])
+        )
+
         html = f"""
-        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:10pt;">
-          <table width="100%"  style="border-collapse:collapse">
-            <tr style="background-color:#5b2c8e;">
-              <td style="padding:14px; text-align:center; color:#ffffff;">
-                <div style="font-size:21pt; font-weight:bold;">{studio_name}</div>
-                <div style="font-size:12pt;">گزارش ریز کارکرد پرسنل</div>
-              </td>
-              <td width="26%"  style="padding:14px;color:#ffffff;font-size:9pt;text-align:left">
-                <div>تاریخ: {now.strftime('%Y/%m/%d')}</div>
-                <div>دوره: {period}</div>
-                <div>سال کاری: {work_year}</div>
-              </td>
-            </tr>
-          </table>
-
-          <table width="100%"  style="border-collapse:collapse;margin-top:10px">
-            <tr>
-              <td width="50%"  style="border:1px solid #9bb0c4;padding:7px;background-color:#f3ecfb">
-                <b>کد پرسنل:</b> {p[0] or '-'}
-              </td>
-              <td style="border:1px solid #9bb0c4; padding:7px; background-color:#f3ecfb;">
-                <b>نام و نام خانوادگی:</b> {p[1]}
-              </td>
-            </tr>
-            <tr>
-              <td style="border:1px solid #9bb0c4; padding:7px;"><b>نقش / تخصص:</b> {p[2]}</td>
-              <td style="border:1px solid #9bb0c4; padding:7px;"><b>تلفن:</b> {p[3] or '-'}</td>
-            </tr>
-          </table>
-
-          <div style="margin-top:12px; font-size:11pt; font-weight:bold; color:#5b2c8e;">
+        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:9pt;">
+          {InvoiceBuilder._title_band(
+              p, studio_name,
+              "<div style='font-size:10pt;'>گزارش ریز کارکرد پرسنل</div>",
+              [f"تاریخ: {now.strftime('%Y/%m/%d')}", f"دوره: {period}",
+               f"سال کاری: {work_year}"])}
+          <table width="100%" style="border-collapse:collapse; margin-top:5px;">{info_rows}</table>
+          <div style="margin-top:6px; font-size:9pt; font-weight:bold; color:{p['accent']};">
             ریز پرداختی‌ها ({period})
           </div>
-          <table width="100%"  style="border-collapse:collapse;font-size:9pt;margin-top:4px">
-            <thead>
-              <tr style="background-color:#2C6699; color:#ffffff;">
-                <th width="7%"  style="border:1px solid #9bb0c4;padding:6px">ردیف</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">تاریخ</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">دسته</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">شرح</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">مبلغ (تومان)</th>
-              </tr>
-            </thead>
-            <tbody>
-              {trans_rows if trans_rows else "<tr><td colspan='5' style='border:1px solid #9bb0c4; padding:6px; text-align:center;'>تراکنشی یافت نشد</td></tr>"}
-            </tbody>
+          <table width="100%" style="border-collapse:collapse; margin-top:2px;">
+            <thead>{InvoiceBuilder._head(['ردیف', 'تاریخ', 'دسته', 'شرح', 'مبلغ (تومان)'], bg=p['table_head'], fg=p['table_head_fg'])}</thead>
+            <tbody>{trans_rows}</tbody>
             <tfoot>
-              <tr style="background-color:#ffe9a8;">
-                <td colspan="4" style="border:1px solid #9bb0c4; padding:9px; text-align:left;"><b>جمع کل پرداختی به این فرد</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px; text-align:center;"><b>{total_salary:,}</b></td>
-              </tr>
+              {InvoiceBuilder._row([
+                  InvoiceBuilder._td("<b>جمع کل پرداختی به این فرد</b>", align="right",
+                                     colspan=4, bg=p["total_bg"], size="9pt", bold=True),
+                  InvoiceBuilder._td(f"<b>{total_salary:,}</b>", bg=p["total_bg"], size="9pt", bold=True),
+              ])}
             </tfoot>
           </table>
-
-          <div style="margin-top:10px; font-size:10pt;">
+          <div style="margin-top:6px; font-size:8.5pt;">
             <b>جمع کل به حروف:</b> {number_to_persian_words(total_salary)} تومان
           </div>
-
-          <div style="text-align:center; margin-top:40px; font-size:10pt;">
+          <div style="text-align:center; margin-top:26px; font-size:9pt;">
             مهر و امضای مدیر / حسابداری
           </div>
-          <div style="text-align:center; margin-top:20px; font-size:8pt; color:#7f8c8d; border-top:1px solid #cfdbe8; padding-top:8px;">
-            {studio_name} &nbsp;|&nbsp; تلفن: {studio_phone}
+          <div style="text-align:center; margin-top:10px; font-size:7pt; color:{p['muted']};">
+            {studio_name} | تلفن: {studio_phone}
           </div>
         </div>
         """
-        filename = f"ریز_کارکرد_{p[1]}_{period}.pdf"
+        filename = f"ریز_کارکرد_{pr[1]}_{period}.pdf"
         return html, filename
 
 
-# ============================================================
-# ================  StudioAccountingApp  ====================
-# ============================================================
 class StudioAccountingApp(QMainWindow):
     ROLES = ["تدوینگر", "عکاس", "فیلمبردار", "هلی شات و FPV کار", "اوپراتور کرین"]
     PROJECT_TYPES = ["عروسی", "عقد", "تولد", "تبلیغاتی", "قبض و کرایه"]
@@ -3945,7 +4765,9 @@ class StudioAccountingApp(QMainWindow):
         self.stack.addWidget(self.main_app_screen)
 
         self.stack.setCurrentWidget(self.dashboard_screen)
-        self.center_on_screen()
+        # اگر کاربر قبلاً ابعاد/مکان پنجره را تغییر داده باشد، همان حالت برمی‌گردد
+        if not restore_geometry("main", self):
+            self.center_on_screen()
 
     def center_on_screen(self):
         """قرار گرفتن پنجره برنامه در وسط صفحه نمایش"""
@@ -4034,57 +4856,104 @@ class StudioAccountingApp(QMainWindow):
             print("Error in check alerts:", e)
 
     def make_dashboard_button(self, icon, title, color, index):
-        """ساخت کارت گرافیکی بزرگ منو با آیکون متناسب"""
-        btn = QPushButton()
-        btn.setFixedSize(168, 140)
+        """
+        کارت گرافیکی منو با انیمیشن:
+        با ورود موس، دکمه کمی بزرگ‌تر می‌شود و حلقه رنگی دور آیکون روشن می‌گردد.
+        """
+        base_w, base_h = 150, 128
+        grow = 12
+        m = grow // 2
+
+        holder = QWidget()
+        holder.setFixedSize(base_w + grow, base_h + grow)
+        holder.setStyleSheet("background: transparent;")
+
+        btn = HoverTileButton(holder)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        light = shade_color(color, 25)
-        dark = shade_color(color, -35)
-        btn.setStyleSheet(f"""
+        btn.setGeometry(m, m, base_w, base_h)
+
+        small_rect = QRect(m, m, base_w, base_h)
+        big_rect = QRect(0, 0, base_w + grow, base_h + grow)
+
+        ring_on = shade_color(color, 95)
+
+        def tile_style(ring_color, ring_width):
+            return f"""
             QPushButton {{
                 background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 {light}, stop:0.55 {color}, stop:1 {dark});
-                border: 1px solid rgba(255,255,255,110);
-                border-radius: 16px;
-            }}
-            QPushButton:hover {{
-                background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 {shade_color(color, 45)}, stop:1 {shade_color(color, -10)});
-                border: 2px solid #ffffff;
-            }}
-            QPushButton:pressed {{
-                background-color: {dark};
-                border: 2px solid #e6eef7;
+                    stop:0 {shade_color(color, 28)}, stop:0.55 {color},
+                    stop:1 {shade_color(color, -40)});
+                border: {ring_width}px solid {ring_color};
+                border-radius: 17px;
             }}
             QLabel {{ background: transparent; color: #ffffff; border: none; }}
-        """)
+            """
+
+        btn.setStyleSheet(tile_style("rgba(255,255,255,120)", 1))
+
         lay = QVBoxLayout(btn)
-        lay.setContentsMargins(6, 14, 6, 12)
-        lay.setSpacing(6)
+        lay.setContentsMargins(5, 10, 5, 9)
+        lay.setSpacing(5)
 
         lbl_icon = QLabel(icon)
         lbl_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_icon.setStyleSheet("font-size: 27pt; background: transparent;")
+        lbl_icon.setStyleSheet("font-size: 25pt; background: transparent;")
         lbl_icon.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         lbl_title = QLabel(title)
         lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_title.setWordWrap(True)
-        lbl_title.setStyleSheet("font-size: 9.5pt; font-weight: bold; background: transparent;")
+        lbl_title.setStyleSheet("font-size: 9pt; font-weight: bold; background: transparent;")
         lbl_title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
 
         lay.addWidget(lbl_icon, 3)
         lay.addWidget(lbl_title, 2)
 
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(18)
+        shadow.setColor(QColor(31, 78, 120, 80))
+        shadow.setOffset(0, 4)
+        btn.setGraphicsEffect(shadow)
+
+        anim = QPropertyAnimation(btn, b"geometry", btn)
+        anim.setDuration(165)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+        def animate_to(target):
+            try:
+                anim.stop()
+                anim.setStartValue(btn.geometry())
+                anim.setEndValue(target)
+                anim.start()
+            except Exception as e:
+                print("[DASH] animation error:", e)
+
+        def on_enter():
+            c = QColor(ring_on)
+            btn.setStyleSheet(tile_style(ring_on, 3))
+            shadow.setBlurRadius(34)
+            shadow.setColor(QColor(c.red(), c.green(), c.blue(), 200))
+            lbl_icon.setStyleSheet("font-size: 29pt; background: transparent;")
+            animate_to(big_rect)
+
+        def on_leave():
+            btn.setStyleSheet(tile_style("rgba(255,255,255,120)", 1))
+            shadow.setBlurRadius(18)
+            shadow.setColor(QColor(31, 78, 120, 80))
+            lbl_icon.setStyleSheet("font-size: 25pt; background: transparent;")
+            animate_to(small_rect)
+
+        btn.on_enter = on_enter
+        btn.on_leave = on_leave
         btn.clicked.connect(lambda _, i=index: self.open_tab_index(i))
         btn.setToolTip(f"ورود به بخش {title}")
-        card_shadow(btn, blur=18, dy=5, alpha=80)
-        return btn
+        btn._anim = anim
+        return holder
 
     def setup_dashboard_ui(self):
         root = QVBoxLayout()
-        root.setContentsMargins(24, 18, 24, 18)
-        root.setSpacing(10)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(8)
         root.addStretch(1)
 
         # ---------------- سربرگ گرافیکی ----------------
@@ -4100,15 +4969,15 @@ class StudioAccountingApp(QMainWindow):
         """)
         card_shadow(header, blur=26, dy=6, alpha=90)
         h_lay = QVBoxLayout(header)
-        h_lay.setContentsMargins(18, 14, 18, 14)
+        h_lay.setContentsMargins(18, 12, 18, 12)
         h_lay.setSpacing(3)
 
         lbl_title = QLabel(f"{ico('commercial')} سیستم جامع مدیریت مالی و حسابداری IMART STUDIO")
         lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl_title.setFont(QFont(APP_FONT_FAMILY, 17, QFont.Weight.Bold))
+        lbl_title.setFont(QFont(APP_FONT_FAMILY, 16, QFont.Weight.Bold))
         h_lay.addWidget(lbl_title)
 
-        lbl_sub = QLabel(f"نسخه {APP_VERSION} &nbsp;|&nbsp; طراح: {DEVELOPER_NAME} &nbsp;|&nbsp; "
+        lbl_sub = QLabel(f"نسخه {APP_VERSION}  |  طراح: {DEVELOPER_NAME}  |  "
                          f"پشتیبانی: {get_setting('studio_phone', '09173736618')}")
         lbl_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_sub.setStyleSheet("color: #cfe4f7; font-size: 10pt; background: transparent;")
@@ -4116,10 +4985,10 @@ class StudioAccountingApp(QMainWindow):
 
         wrap_header = QHBoxLayout()
         wrap_header.addStretch(1)
-        wrap_header.addWidget(header, 6)
+        wrap_header.addWidget(header, 8)
         wrap_header.addStretch(1)
         root.addLayout(wrap_header)
-        root.addSpacing(6)
+        root.addSpacing(4)
 
         # ---------------- نوار سال کاری با سوییچ قبل/بعد ----------------
         year_card = QFrame()
@@ -4128,8 +4997,8 @@ class StudioAccountingApp(QMainWindow):
             QLabel { background: transparent; }
         """)
         year_lay = QHBoxLayout(year_card)
-        year_lay.setContentsMargins(14, 10, 14, 10)
-        year_lay.setSpacing(8)
+        year_lay.setContentsMargins(12, 8, 12, 8)
+        year_lay.setSpacing(7)
 
         lbl_year = QLabel(f"{ico('calendar')} سال کاری:")
         lbl_year.setFont(QFont(APP_FONT_FAMILY, 12, QFont.Weight.Bold))
@@ -4138,13 +5007,13 @@ class StudioAccountingApp(QMainWindow):
 
         self.btn_year_prev = QPushButton(f"{ico('prev')} سال قبل")
         self.btn_year_prev.setToolTip("نمایش اطلاعات سال کاری قبل")
-        self.btn_year_prev.setStyleSheet("background-color:#7f8c8d; color:white; font-weight:bold; padding:8px 12px;")
+        self.btn_year_prev.setStyleSheet("background-color:#7f8c8d; color:white; font-weight:bold; padding:7px 11px;")
         self.btn_year_prev.clicked.connect(lambda: self.step_work_year(-1))
         year_lay.addWidget(self.btn_year_prev)
 
         self.combo_work_year = QComboBox()
         self.combo_work_year.setFont(QFont(APP_FONT_FAMILY, 12, QFont.Weight.Bold))
-        self.combo_work_year.setFixedWidth(130)
+        self.combo_work_year.setFixedWidth(120)
         self.combo_work_year.setStyleSheet("padding:6px; border:2px solid #2980b9; border-radius:8px;")
         self.load_work_years()
         current_year = get_current_year()
@@ -4156,27 +5025,32 @@ class StudioAccountingApp(QMainWindow):
 
         self.btn_year_next = QPushButton(f"سال بعد {ico('next')}")
         self.btn_year_next.setToolTip("نمایش اطلاعات سال کاری بعد")
-        self.btn_year_next.setStyleSheet("background-color:#7f8c8d; color:white; font-weight:bold; padding:8px 12px;")
+        self.btn_year_next.setStyleSheet("background-color:#7f8c8d; color:white; font-weight:bold; padding:7px 11px;")
         self.btn_year_next.clicked.connect(lambda: self.step_work_year(1))
         year_lay.addWidget(self.btn_year_next)
 
         btn_new_year = QPushButton(ico_text("add", "شروع سال کاری جدید"))
-        btn_new_year.setStyleSheet("background-color:#27ae60; color:white; font-weight:bold; padding:8px 12px;")
+        btn_new_year.setStyleSheet("background-color:#27ae60; color:white; font-weight:bold; padding:7px 11px;")
         btn_new_year.clicked.connect(self.start_new_work_year)
         year_lay.addWidget(btn_new_year)
 
         year_lay.addStretch()
 
-        self.lbl_dash_summary = QLabel("")
-        self.lbl_dash_summary.setStyleSheet("color:#405060; font-size:10pt;")
-        year_lay.addWidget(self.lbl_dash_summary)
-
         wrap_year = QHBoxLayout()
         wrap_year.addStretch(1)
-        wrap_year.addWidget(year_card, 8)
+        wrap_year.addWidget(year_card, 9)
         wrap_year.addStretch(1)
         root.addLayout(wrap_year)
-        root.addSpacing(8)
+
+        # خلاصه وضعیت سال کاری در یک ردیف جداگانه تا کامل دیده شود
+        self.lbl_dash_summary = QLabel("")
+        self.lbl_dash_summary.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_dash_summary.setWordWrap(True)
+        self.lbl_dash_summary.setStyleSheet(
+            "color:#1F4E78; font-size:9.5pt; font-weight:bold; "
+            "background-color:#ffffff; border:1px solid #d6e0ec; border-radius:10px; padding:6px;")
+        root.addWidget(self.lbl_dash_summary)
+        root.addSpacing(4)
 
         # ---------------- ۱۲ آیتم در دو ردیف ۶ تایی وسط‌چین ----------------
         buttons = [
@@ -4195,7 +5069,7 @@ class StudioAccountingApp(QMainWindow):
         ]
 
         grid = QGridLayout()
-        grid.setSpacing(14)
+        grid.setSpacing(10)
         grid.setContentsMargins(0, 0, 0, 0)
         for i, (icon, text, index, color) in enumerate(buttons):
             r, c = divmod(i, 6)
@@ -4209,10 +5083,9 @@ class StudioAccountingApp(QMainWindow):
 
         root.addStretch(1)
 
-        footer = QLabel(f"{ico('money')} IMART STUDIO &nbsp;|&nbsp; تلفن: 09173736618 &nbsp;|&nbsp; "
-                        f"نسخه {APP_VERSION}")
+        footer = QLabel(f"{ico('money')} IMART STUDIO  |  تلفن: 09173736618  |  نسخه {APP_VERSION}")
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        footer.setStyleSheet("color:#5d6d7e; font-size:9pt; padding-top:6px;")
+        footer.setStyleSheet("color:#5d6d7e; font-size:9pt; padding-top:4px;")
         root.addWidget(footer)
 
         self.dashboard_screen.setLayout(root)
@@ -4234,8 +5107,8 @@ class StudioAccountingApp(QMainWindow):
             open_checks = cursor.fetchone()[0]
             conn.close()
             self.lbl_dash_summary.setText(
-                f"قرارداد: {c_count} &nbsp;|&nbsp; پروژه: {p_count} &nbsp;|&nbsp; "
-                f"جمع قراردادها: {c_sum:,} تومان &nbsp;|&nbsp; چک باز: {open_checks}"
+                f"قرارداد: {c_count}  |  پروژه: {p_count}  |  "
+                f"جمع قراردادها: {c_sum:,} تومان  |  چک باز: {open_checks}"
             )
         except Exception as e:
             print("[DASH] summary error:", e)
@@ -4319,6 +5192,7 @@ class StudioAccountingApp(QMainWindow):
                 self.load_checks_table()
                 self.load_report_persons_combo()
                 self.calculate_financial_report()
+                self.refresh_settlement_cards()
             except Exception as e:
                 print("Refresh error:", e)
 
@@ -4338,50 +5212,58 @@ class StudioAccountingApp(QMainWindow):
             self.tabs.setCurrentIndex(index)
             self.stack.setCurrentWidget(self.main_app_screen)
 
-    def _output_flow(self, builder, default_filename, title="سند", allow_details=True):
+    def _output_flow(self, builder, default_filename, title="سند",
+                     allow_details=True, allow_staff=False):
         """
-        مسیر مشترک خروجی برای همه اسناد:
-        انتخاب چاپ یا PDF و انتخاب با/بدون ریز پکیج.
+        مسیر مشترک خروجی همه اسناد:
+        انتخاب چاپ (سیاه و سفید) یا PDF (رنگی)، با/بدون ریز پکیج، با/بدون نیروی کار.
+        همه اسناد روی یک برگ A5 چاپ می‌شوند.
         """
-        dlg = PrintChoiceDialog(self, title, allow_details)
+        dlg = PrintChoiceDialog(self, title, allow_details, allow_staff)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
+        is_print = (dlg.mode == "print")
         try:
-            html = builder(dlg.with_details)
+            html = builder(dlg.with_details, dlg.with_staff, is_print)
         except TypeError:
-            html = builder()
+            try:
+                html = builder(dlg.with_details, dlg.with_staff)
+            except TypeError:
+                html = builder()
         if not html:
             QMessageBox.warning(self, "خطا", "سندی برای چاپ یافت نشد.")
             return
 
         if dlg.mode == "pdf":
-            path, _ = QFileDialog.getSaveFileName(self, "ذخیره PDF", default_filename, "PDF Files (*.pdf)")
+            path, _ = QFileDialog.getSaveFileName(self, "ذخیره PDF", default_filename,
+                                                  "PDF Files (*.pdf)")
             if not path:
                 return
             ok, err = save_html_pdf(html, path, title)
             if ok:
-                QMessageBox.information(self, "موفقیت", f"فایل PDF با موفقیت ذخیره شد:\n{path}")
+                QMessageBox.information(self, "موفقیت", f"فایل PDF رنگی ذخیره شد:\n{path}")
             else:
                 QMessageBox.critical(self, "خطا", f"ساخت PDF ناموفق بود:\n{err}")
         else:
             print_html_document(html, self, title)
 
     def _contract_print_flow(self, contract_id):
-        _html, filename = InvoiceBuilder.build_wedding_invoice(contract_id, with_details=True)
+        _html, filename = InvoiceBuilder.build_wedding_invoice(contract_id)
         if not _html:
             QMessageBox.warning(self, "خطا", "قرارداد مورد نظر یافت نشد.")
             return
         self._output_flow(
-            lambda with_details: InvoiceBuilder.build_wedding_invoice(contract_id, with_details)[0],
-            filename, "فاکتور قرارداد عروس و داماد", allow_details=True)
+            lambda wd, ws, mono: InvoiceBuilder.build_wedding_invoice(contract_id, wd, ws, mono)[0],
+            filename, "فاکتور قرارداد عروس و داماد", allow_details=True, allow_staff=True)
 
     def _commercial_print_flow(self, project_id):
         html, filename = InvoiceBuilder.build_commercial_invoice(project_id)
         if not html:
             QMessageBox.warning(self, "خطا", "پروژه مورد نظر یافت نشد.")
             return
-        self._output_flow(lambda with_details: InvoiceBuilder.build_commercial_invoice(project_id)[0],
-                          filename, "فاکتور پروژه تبلیغاتی", allow_details=False)
+        self._output_flow(
+            lambda wd, ws, mono: InvoiceBuilder.build_commercial_invoice(project_id, wd, ws, mono)[0],
+            filename, "فاکتور پروژه تبلیغاتی", allow_details=False, allow_staff=False)
 
     def export_table_excel(self, table, title, default_name):
         """خروجی اکسل از یک جدول برنامه (openpyxl)"""
@@ -4412,6 +5294,13 @@ class StudioAccountingApp(QMainWindow):
             QMessageBox.information(self, "موفقیت", f"خروجی اکسل ذخیره شد:\n{path}")
         else:
             QMessageBox.critical(self, "خطا", f"خروجی اکسل ناموفق بود:\n{err}")
+
+    def exit_application(self):
+        """
+        دکمه خروج: دقیقاً مانند زدن ضربدر پنجره عمل می‌کند؛
+        یعنی ابتدا منوی بک‌آپ باز می‌شود و بعد از ذخیره، برنامه بسته می‌شود.
+        """
+        self.close()
 
     def setup_main_app_ui(self):
         main_layout = QVBoxLayout()
@@ -4453,6 +5342,8 @@ class StudioAccountingApp(QMainWindow):
                 "برگرداندن اطلاعات از فایل پشتیبان")
         add_top("key", "تغییر رمز", self.change_password, "#c0392b",
                 "تغییر رمز عبور برنامه")
+        add_top("cancel", "خروج از برنامه", self.exit_application, "#7b241c",
+                "ذخیره نسخه پشتیبان و بستن برنامه (مانند زدن ضربدر پنجره)")
 
         top_bar.addStretch()
 
@@ -4508,8 +5399,8 @@ class StudioAccountingApp(QMainWindow):
         self.setup_workyear_tab()
         self.setup_about_tab()
 
-        footer = QLabel(f"{ico('commercial')} IMART STUDIO &nbsp;|&nbsp; تلفن: 09173736618 "
-                        f"&nbsp;|&nbsp; نسخه {APP_VERSION} &nbsp;|&nbsp; طراح: {DEVELOPER_NAME}")
+        footer = QLabel(f"{ico('commercial')} IMART STUDIO  |  تلفن: 09173736618 "
+                        f" |  نسخه {APP_VERSION}  |  طراح: {DEVELOPER_NAME}")
         footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
         footer.setFont(QFont(APP_FONT_FAMILY, 9))
         footer.setStyleSheet("color: #5d6d7e; padding-top: 3px;")
@@ -4575,12 +5466,10 @@ class StudioAccountingApp(QMainWindow):
     # ==============  تب ۱: عروس و داماد  =======================
     # ============================================================
     def setup_wedding_tab(self):
-        layout = QHBoxLayout()
-        layout.setSpacing(10)
-
         # ==================== فرم ثبت قرارداد ====================
         form_scroll = QScrollArea()
         form_scroll.setWidgetResizable(True)
+        form_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         form_holder = QWidget()
         form_holder_layout = QVBoxLayout(form_holder)
         form_holder_layout.setContentsMargins(0, 0, 0, 0)
@@ -4588,7 +5477,7 @@ class StudioAccountingApp(QMainWindow):
         form_box = QGroupBox("ثبت قرارداد جدید عروس و داماد")
         form_box.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
         form_layout = QFormLayout()
-        form_layout.setSpacing(7)
+        form_layout.setSpacing(5)
 
         self.w_groom = QLineEdit()
         self.w_bride = QLineEdit()
@@ -4596,6 +5485,8 @@ class StudioAccountingApp(QMainWindow):
         self.w_bride_phone = QLineEdit()
         self.w_contract_date = PersianDateEdit(date_str=jalali_today_str())
         self.w_ceremony_date = PersianDateEdit(date_str=jalali_today_str())
+        self.w_venue = QLineEdit()
+        self.w_venue.setPlaceholderText("نام تالار / باغ / مکان برگزاری مراسم")
 
         form_layout.addRow(f"{ico('wedding')} نام داماد <span style='color:red;'>*</span>:", self.w_groom)
         form_layout.addRow(f"{ico('wedding')} نام عروس <span style='color:red;'>*</span>:", self.w_bride)
@@ -4603,18 +5494,23 @@ class StudioAccountingApp(QMainWindow):
         form_layout.addRow(f"{ico('people')} تلفن عروس:", self.w_bride_phone)
         form_layout.addRow(f"{ico('calendar')} تاریخ قرارداد:", self.w_contract_date)
         form_layout.addRow(f"{ico('calendar')} تاریخ مراسم:", self.w_ceremony_date)
+        form_layout.addRow(f"{ico('home')} مکان مراسم:", self.w_venue)
 
         btn_manage_items = QPushButton(ico_text("package", "مدیریت / افزودن پکیج، کالا و تجهیزات"))
-        btn_manage_items.setStyleSheet("background-color: #e67e22; color: white; font-weight: bold; padding: 8px;")
+        btn_manage_items.setStyleSheet("background-color: #e67e22; color: white; font-weight: bold; padding: 7px;")
         btn_manage_items.clicked.connect(self.open_manage_items)
         form_layout.addRow(btn_manage_items)
 
+        # ---- لیست اقلام: بدون اسکرول افقی، ردیف‌ها ریز و متن‌ها کوتاه می‌شوند ----
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
-        scroll_area.setFixedHeight(210)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll_area.setFixedHeight(230)
 
         self.items_container = QWidget()
         self.items_vbox = QVBoxLayout()
+        self.items_vbox.setContentsMargins(0, 0, 0, 0)
+        self.items_vbox.setSpacing(1)
         self.items_container.setLayout(self.items_vbox)
         scroll_area.setWidget(self.items_container)
 
@@ -4627,7 +5523,7 @@ class StudioAccountingApp(QMainWindow):
         self.w_lbl_total = QLabel("")
         self.w_lbl_total.setWordWrap(True)
         self.w_lbl_total.setStyleSheet("background-color:#e8f8f5; border:1px solid #16a085; "
-                                       "border-radius:8px; padding:9px; font-size:11pt;")
+                                       "border-radius:8px; padding:8px; font-size:10pt;")
         form_layout.addRow(self.w_lbl_total)
 
         self.w_discount = QLineEdit("0")
@@ -4643,8 +5539,8 @@ class StudioAccountingApp(QMainWindow):
         form_layout.addRow(f"{ico('banks')} بانک واریزی بیعانه:", self.w_bank_combo)
 
         self.w_lbl_remain = QLabel("")
-        self.w_lbl_remain.setFont(QFont(APP_FONT_FAMILY, 11, QFont.Weight.Bold))
-        self.w_lbl_remain.setStyleSheet("color: #c0392b; font-size: 11pt; padding:4px;")
+        self.w_lbl_remain.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
+        self.w_lbl_remain.setStyleSheet("color: #c0392b; font-size: 10pt; padding:3px;")
         form_layout.addRow(self.w_lbl_remain)
 
         # ---------- نیروی کار قرارداد ----------
@@ -4652,9 +5548,12 @@ class StudioAccountingApp(QMainWindow):
         staff_box_layout = QVBoxLayout()
         staff_scroll = QScrollArea()
         staff_scroll.setWidgetResizable(True)
-        staff_scroll.setFixedHeight(150)
+        staff_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        staff_scroll.setFixedHeight(140)
         self.staff_container = QWidget()
         self.staff_vbox = QVBoxLayout()
+        self.staff_vbox.setContentsMargins(0, 0, 0, 0)
+        self.staff_vbox.setSpacing(1)
         self.staff_container.setLayout(self.staff_vbox)
         staff_scroll.setWidget(self.staff_container)
         staff_box_layout.addWidget(staff_scroll)
@@ -4662,7 +5561,7 @@ class StudioAccountingApp(QMainWindow):
         form_layout.addRow(staff_box)
 
         self.w_desc = QTextEdit()
-        self.w_desc.setFixedHeight(60)
+        self.w_desc.setFixedHeight(54)
         self.w_desc.setPlaceholderText("توضیحات کامل قرارداد...")
         form_layout.addRow(f"{ico('edit')} توضیحات قرارداد:", self.w_desc)
 
@@ -4676,15 +5575,14 @@ class StudioAccountingApp(QMainWindow):
         self.load_staff_checkboxes()
 
         self.btn_save_wedding = QPushButton(ico_text("save", "ثبت نهایی قرارداد و صدور کد یکتا"))
-        self.btn_save_wedding.setFont(QFont(APP_FONT_FAMILY, 11, QFont.Weight.Bold))
-        self.btn_save_wedding.setStyleSheet("background-color: #2980b9; color: white; padding: 11px;")
+        self.btn_save_wedding.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
+        self.btn_save_wedding.setStyleSheet("background-color: #2980b9; color: white; padding: 10px;")
         self.btn_save_wedding.clicked.connect(self.save_wedding_contract)
         form_layout.addRow(self.btn_save_wedding)
 
         form_box.setLayout(form_layout)
         form_holder_layout.addWidget(form_box)
         form_scroll.setWidget(form_holder)
-        layout.addWidget(form_scroll, 3)
 
         # ==================== جدول قراردادها ====================
         table_box = QGroupBox("لیست قراردادها (برای جزئیات دوبار کلیک کنید)")
@@ -4695,32 +5593,60 @@ class StudioAccountingApp(QMainWindow):
         btn_refresh = QPushButton(ico_text("refresh", "بروزرسانی"))
         btn_refresh.clicked.connect(self.load_wedding_contracts)
         btn_excel = QPushButton(ico_text("excel", "خروجی اکسل"))
-        btn_excel.setStyleSheet("background-color:#1e8449; color:white; font-weight:bold; padding:7px;")
+        btn_excel.setStyleSheet("background-color:#1e8449; color:white; font-weight:bold; padding:6px;")
         btn_excel.clicked.connect(lambda: self.export_table_excel(
             self.w_table, "قراردادهای عروس و داماد",
             f"قراردادها_{get_current_year()}.xlsx"))
         tools.addWidget(btn_refresh)
         tools.addWidget(btn_excel)
+
+        tools.addWidget(QLabel(f"{ico('filter')} دسته‌بندی:"))
+        self.combo_sort = QComboBox()
+        self.combo_sort.addItems([
+            "ترتیب عادی (جدیدترین)",
+            "نزدیک‌ترین تاریخ مراسم",
+            "تسویه‌نشده‌ها",
+            "مبلغ: کم به زیاد",
+            "مبلغ: زیاد به کم",
+        ])
+        self.combo_sort.setToolTip("ترتیب و دسته‌بندی نمایش قراردادها")
+        self.combo_sort.currentIndexChanged.connect(self.load_wedding_contracts)
+        tools.addWidget(self.combo_sort)
         tools.addStretch()
         table_layout.addLayout(tools)
 
         self.w_table = QTableWidget()
-        self.w_table.setColumnCount(15)
+        self.w_table.setColumnCount(17)
         self.w_table.setHorizontalHeaderLabels([
-            "کد", "زوجین", "تلفن داماد", "تلفن عروس", "تاریخ مراسم",
-            "جمع خام", "تخفیف", "جمع بعد از تخفیف", "دریافتی", "مانده",
-            "وضعیت", "بیعانه‌ها", "چاپ / PDF", "ویرایش", "حذف"
+            "کد", "زوجین", "تلفن داماد", "تلفن عروس", "تاریخ مراسم", "مکان مراسم",
+            "روزشمار مراسم", "جمع خام", "تخفیف", "جمع بعد از تخفیف", "دریافتی", "مانده",
+            "وضعیت تسویه", "بیعانه‌ها", "چاپ / PDF", "ویرایش", "حذف"
         ])
         self.w_table.setAlternatingRowColors(True)
         self.w_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.w_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.w_table.verticalHeader().setDefaultSectionSize(34)
+        self.w_table.verticalHeader().setDefaultSectionSize(32)
         self.w_table.doubleClicked.connect(self.on_wedding_double_click)
+        persist_table(self.w_table, "wedding_contracts", QHeaderView.ResizeMode.ResizeToContents)
         table_layout.addWidget(self.w_table)
         table_box.setLayout(table_layout)
-        layout.addWidget(table_box, 5)
 
-        self.tab_wedding.setLayout(layout)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        form_holder_wrap = QWidget()
+        fw = QVBoxLayout(form_holder_wrap)
+        fw.setContentsMargins(0, 0, 0, 0)
+        fw.addWidget(form_scroll)
+        table_wrap = QWidget()
+        tw = QVBoxLayout(table_wrap)
+        tw.setContentsMargins(0, 0, 0, 0)
+        tw.addWidget(table_box)
+        splitter.addWidget(form_holder_wrap)
+        splitter.addWidget(table_wrap)
+        splitter.setSizes([560, 840])
+        persist_splitter(splitter, "tab_wedding")
+
+        outer = QHBoxLayout()
+        outer.addWidget(splitter)
+        self.tab_wedding.setLayout(outer)
         self.load_wedding_contracts()
 
     def open_manage_items(self):
@@ -4730,7 +5656,9 @@ class StudioAccountingApp(QMainWindow):
         self.load_inventory()
 
     def show_package_details_from_tab(self, name):
-        PackageDetailsDialog(name, self).exec()
+        dlg = PackageDetailsDialog(name, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.load_item_checkboxes()
 
     def load_item_checkboxes(self):
         for i in reversed(range(self.items_vbox.count())):
@@ -4754,29 +5682,32 @@ class StudioAccountingApp(QMainWindow):
 
         def add_row(item_name, code, price, is_pkg, indent=False):
             row_w = QWidget()
-            row_l = QHBoxLayout()
-            row_l.setContentsMargins(22 if indent else 0, 0, 0, 0)
-            row_l.setSpacing(6)
+            row_w.setFixedHeight(26)
+            row_l = QHBoxLayout(row_w)
+            row_l.setContentsMargins(16 if indent else 0, 0, 0, 0)
+            row_l.setSpacing(5)
 
-            cb = QCheckBox(f"{'└ ' if indent else ''}[{code or '-'}] {item_name}")
-            cb.stateChanged.connect(self.calc_wedding_total)
-            cb.setFont(QFont(APP_FONT_FAMILY, 10,
+            cb = ElidedCheckBox(f"{'• ' if indent else ''}[{code or '-'}] {item_name}")
+            cb.setFont(QFont(APP_FONT_FAMILY, 9,
                              QFont.Weight.Normal if indent else QFont.Weight.Bold))
+            cb.setToolTip(f"{item_name}  ({price:,} تومان)")
+            cb.stateChanged.connect(self.calc_wedding_total)
 
             txt_p = QLineEdit(f"{price:,}")
-            txt_p.setFixedWidth(115)
+            txt_p.setFixedWidth(90)
+            txt_p.setFixedHeight(22)
+            txt_p.setFont(QFont(APP_FONT_FAMILY, 9))
+            txt_p.setToolTip("قیمت این مورد در این قرارداد")
             txt_p.textChanged.connect(lambda t, p=txt_p: p.setText(format_number(t)))
             txt_p.textChanged.connect(self.calc_wedding_total)
 
-            row_l.addWidget(cb)
-            row_l.addStretch()
+            row_l.addWidget(cb, 1)
             if is_pkg:
                 btn_det = QPushButton(ico("detail"))
-                btn_det.setFixedWidth(34)
-                btn_det.setToolTip("نمایش جزئیات کامل این پکیج")
+                btn_det.setFixedSize(24, 22)
+                btn_det.setToolTip("مدیریت و جزئیات کامل این پکیج")
                 btn_det.clicked.connect(lambda _, n=item_name: self.show_package_details_from_tab(n))
                 row_l.addWidget(btn_det)
-            row_l.addWidget(QLabel("قیمت:"))
             row_l.addWidget(txt_p)
             row_w.setLayout(row_l)
 
@@ -4824,21 +5755,24 @@ class StudioAccountingApp(QMainWindow):
 
         for pid, pcode, pname, prole in persons:
             row_w = QWidget()
-            row_l = QHBoxLayout()
+            row_w.setFixedHeight(26)
+            row_l = QHBoxLayout(row_w)
             row_l.setContentsMargins(0, 0, 0, 0)
-            row_l.setSpacing(6)
-            cb = QCheckBox(f"[{pcode or '-'}] {pname} ({prole})")
+            row_l.setSpacing(5)
+            cb = ElidedCheckBox(f"[{pcode or '-'}] {pname} ({prole})")
+            cb.setFont(QFont(APP_FONT_FAMILY, 9))
             cb.stateChanged.connect(self.calc_wedding_total)
             wage = QLineEdit("0")
-            wage.setFixedWidth(125)
+            wage.setFixedWidth(90)
+            wage.setFixedHeight(22)
+            wage.setFont(QFont(APP_FONT_FAMILY, 9))
+            wage.setToolTip("حقوق این فرد در این قرارداد")
             wage.textChanged.connect(lambda t, p=wage: p.setText(format_number(t)))
             wage.textChanged.connect(self.calc_wedding_total)
             self.staff_checks[pid] = cb
             self.staff_wages[pid] = wage
             self.staff_meta[pid] = (pname, prole)
-            row_l.addWidget(cb)
-            row_l.addStretch()
-            row_l.addWidget(QLabel("حقوق این قرارداد:"))
+            row_l.addWidget(cb, 1)
             row_l.addWidget(wage)
             row_w.setLayout(row_l)
             self.staff_vbox.addWidget(row_w)
@@ -4881,15 +5815,14 @@ class StudioAccountingApp(QMainWindow):
                 staff_total += parse_number(self.staff_wages[pid].text())
 
         self.w_lbl_total.setText(
-            f"<b>تعداد خدمات انتخاب‌شده:</b> {count_items} &nbsp;|&nbsp; "
+            f"<b>تعداد خدمات انتخاب‌شده:</b> {count_items} | "
             f"<b>جمع قیمت خام:</b> {raw_sum:,} تومان<br>"
-            f"<b>تخفیف:</b> {discount:,} تومان &nbsp;|&nbsp; "
+            f"<b>تخفیف:</b> {discount:,} تومان | "
             f"<b>جمع کل بعد از تخفیف:</b> <span style='color:#2980b9;'>{net_total:,} تومان</span><br>"
             f"<b>مبلغ به حروف:</b> {number_to_persian_words(net_total)} تومان"
         )
         self.w_lbl_remain.setText(
-            f"بیعانه: {deposit:,} تومان &nbsp;|&nbsp; "
-            f"باقی‌مانده حساب: {remain:,} تومان &nbsp;|&nbsp; "
+            f"بیعانه: {deposit:,} تومان | باقی‌مانده حساب: {remain:,} تومان | "
             f"نیروی کار: {staff_count} نفر / {staff_total:,} تومان"
         )
 
@@ -4931,6 +5864,7 @@ class StudioAccountingApp(QMainWindow):
         bank_id = self.w_bank_combo.currentData()
         bank_name = self.w_bank_combo.currentText().replace(ico('banks'), "").strip() if bank_id else ""
         desc = self.w_desc.toPlainText().strip()
+        venue = self.w_venue.text().strip()
         work_year = get_current_year()
 
         staff_list = []
@@ -4956,14 +5890,14 @@ class StudioAccountingApp(QMainWindow):
             INSERT INTO wedding_contracts
             (code, groom_name, bride_name, groom_phone, bride_phone, contract_date,
              ceremony_date, selected_items, total_amount, discount, paid_amount,
-             bank_id, is_settled, description, work_year, items_detail, staff_ids)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             bank_id, is_settled, description, work_year, items_detail, staff_ids, venue)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (code, groom, bride, self.w_groom_phone.text(), self.w_bride_phone.text(),
               self.w_contract_date.text(), self.w_ceremony_date.text(),
               ",".join(selected_items), raw_total, discount, first_deposit,
               bank_id, is_settled, desc, work_year,
               json.dumps(items_detail, ensure_ascii=False),
-              json.dumps(staff_list, ensure_ascii=False)))
+              json.dumps(staff_list, ensure_ascii=False), venue))
 
         contract_id = cursor.lastrowid
         if first_deposit > 0:
@@ -4988,6 +5922,7 @@ class StudioAccountingApp(QMainWindow):
         self.w_bride.clear()
         self.w_groom_phone.clear()
         self.w_bride_phone.clear()
+        self.w_venue.clear()
         self.w_contract_date.set_date(jalali_today_str())
         self.w_ceremony_date.set_date(jalali_today_str())
         self.w_discount.setText("0")
@@ -5006,74 +5941,130 @@ class StudioAccountingApp(QMainWindow):
         self.load_staff_table()
         self.load_person_events()
         self.refresh_dashboard_summary()
+        self.refresh_settlement_cards()
+
+    def _sorted_contracts(self, rows):
+        """اعمال دسته‌بندی انتخابی روی لیست قراردادها"""
+        mode = self.combo_sort.currentText() if hasattr(self, "combo_sort") else "ترتیب عادی (جدیدترین)"
+        data = []
+        for row in rows:
+            (c_id, code, groom, bride, g_phone, b_phone, cer_date, raw,
+             discount, paid, settled, venue) = row
+            raw = raw or 0
+            discount = discount or 0
+            paid = paid or 0
+            net = max(0, raw - discount)
+            state, remain = settlement_state(net, paid)
+            data.append({
+                "id": c_id, "code": code, "groom": groom, "bride": bride,
+                "g_phone": g_phone, "b_phone": b_phone, "ceremony": cer_date,
+                "venue": venue, "raw": raw, "discount": discount, "net": net,
+                "paid": paid, "remain": remain, "state": state, "settled": settled,
+            })
+
+        today = jdatetime.date.today()
+
+        def upcoming_key(d):
+            jd = parse_jalali(d["ceremony"])
+            if jd is None:
+                return (2, 0)
+            diff = (jd - today).days
+            return (0, diff) if diff >= 0 else (1, -diff)
+
+        if mode == "نزدیک‌ترین تاریخ مراسم":
+            data.sort(key=upcoming_key)
+        elif mode == "تسویه‌نشده‌ها":
+            order = {"تسویه نشده": 0, "تسویه ناقص": 1, "تسویه کامل": 2}
+            data.sort(key=lambda d: (order.get(d["state"], 3), upcoming_key(d)))
+        elif mode == "مبلغ: کم به زیاد":
+            data.sort(key=lambda d: d["net"])
+        elif mode == "مبلغ: زیاد به کم":
+            data.sort(key=lambda d: d["net"], reverse=True)
+        else:
+            data.sort(key=lambda d: d["id"], reverse=True)
+        return data
 
     def load_wedding_contracts(self):
+        if not hasattr(self, "w_table"):
+            return
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         work_year = get_current_year()
         cursor.execute('''
             SELECT id, code, groom_name, bride_name, groom_phone, bride_phone,
-                   ceremony_date, total_amount, discount, paid_amount, is_settled
+                   ceremony_date, total_amount, discount, paid_amount, is_settled, venue
             FROM wedding_contracts WHERE work_year=? ORDER BY id DESC
         ''', (work_year,))
         rows = cursor.fetchall()
         conn.close()
 
+        data = self._sorted_contracts(rows)
         self.w_table.setRowCount(0)
-        for r_idx, row in enumerate(rows):
-            (c_id, code, groom, bride, g_phone, b_phone,
-             cer_date, raw, discount, paid, settled) = row
-            raw = raw or 0
-            discount = discount or 0
-            paid = paid or 0
-            net = max(0, raw - discount)
-            remain = max(0, net - paid)
-
+        for r_idx, d in enumerate(data):
             self.w_table.insertRow(r_idx)
-            self.w_table.setItem(r_idx, 0, QTableWidgetItem(code or str(c_id)))
-            self.w_table.setItem(r_idx, 1, QTableWidgetItem(f"{groom} و {bride}"))
-            self.w_table.setItem(r_idx, 2, QTableWidgetItem(g_phone if g_phone else "-"))
-            self.w_table.setItem(r_idx, 3, QTableWidgetItem(b_phone if b_phone else "-"))
-            self.w_table.setItem(r_idx, 4, QTableWidgetItem(cer_date or "-"))
-            self.w_table.setItem(r_idx, 5, QTableWidgetItem(f"{raw:,}"))
-            self.w_table.setItem(r_idx, 6, QTableWidgetItem(f"{discount:,}"))
+            self.w_table.setItem(r_idx, 0, QTableWidgetItem(d["code"] or str(d["id"])))
+            self.w_table.setItem(r_idx, 1, QTableWidgetItem(f"{d['groom']} و {d['bride']}"))
+            self.w_table.setItem(r_idx, 2, QTableWidgetItem(d["g_phone"] or "-"))
+            self.w_table.setItem(r_idx, 3, QTableWidgetItem(d["b_phone"] or "-"))
+            self.w_table.setItem(r_idx, 4, QTableWidgetItem(d["ceremony"] or "-"))
+            self.w_table.setItem(r_idx, 5, QTableWidgetItem(d["venue"] or "-"))
 
-            net_item = QTableWidgetItem(f"{net:,}")
+            days_item = QTableWidgetItem(days_left_short(d["ceremony"]))
+            jd = parse_jalali(d["ceremony"])
+            if jd is not None:
+                diff = (jd - jdatetime.date.today()).days
+                if diff < 0:
+                    days_item.setForeground(QColor("#7f8c8d"))
+                elif diff <= 7:
+                    days_item.setForeground(QColor("#c0392b"))
+                else:
+                    days_item.setForeground(QColor("#1e8449"))
+            self.w_table.setItem(r_idx, 6, days_item)
+
+            self.w_table.setItem(r_idx, 7, QTableWidgetItem(f"{d['raw']:,}"))
+            self.w_table.setItem(r_idx, 8, QTableWidgetItem(f"{d['discount']:,}"))
+
+            net_item = QTableWidgetItem(f"{d['net']:,}")
             net_item.setForeground(QColor("#2980b9"))
-            self.w_table.setItem(r_idx, 7, net_item)
+            self.w_table.setItem(r_idx, 9, net_item)
 
-            self.w_table.setItem(r_idx, 8, QTableWidgetItem(f"{paid:,}"))
+            self.w_table.setItem(r_idx, 10, QTableWidgetItem(f"{d['paid']:,}"))
 
-            remain_item = QTableWidgetItem(f"{remain:,}")
-            remain_item.setForeground(QColor("#c0392b" if remain > 0 else "#27ae60"))
-            self.w_table.setItem(r_idx, 9, remain_item)
+            remain_item = QTableWidgetItem(f"{d['remain']:,}")
+            remain_item.setForeground(QColor("#c0392b" if d["remain"] > 0 else "#27ae60"))
+            self.w_table.setItem(r_idx, 11, remain_item)
 
-            item_settled = QTableWidgetItem("✅ تسویه" if settled else "⏳ در جریان")
-            item_settled.setForeground(QColor("green") if settled else QColor("#e67e22"))
-            self.w_table.setItem(r_idx, 10, item_settled)
+            state_item = QTableWidgetItem(d["state"])
+            state_item.setForeground(QColor(
+                "#27ae60" if d["state"] == "تسویه کامل"
+                else ("#e67e22" if d["state"] == "تسویه ناقص" else "#c0392b")))
+            f = state_item.font()
+            f.setBold(True)
+            state_item.setFont(f)
+            self.w_table.setItem(r_idx, 12, state_item)
 
             btn_dep = QPushButton(ico_text("deposit", "بیعانه‌ها"))
-            btn_dep.setStyleSheet("background-color:#16a085; color:white; font-weight:bold; padding:4px;")
-            btn_dep.clicked.connect(lambda _, cid=c_id: self.open_deposits_dialog(cid))
-            self.w_table.setCellWidget(r_idx, 11, btn_dep)
+            btn_dep.setStyleSheet("background-color:#16a085; color:white; font-weight:bold; padding:3px;")
+            btn_dep.clicked.connect(lambda _, cid=d["id"]: self.open_deposits_dialog(cid))
+            self.w_table.setCellWidget(r_idx, 13, btn_dep)
 
             btn_print = QPushButton(ico_text("print", "چاپ / PDF"))
-            btn_print.setStyleSheet("background-color:#2980b9; color:white; font-weight:bold; padding:4px;")
-            btn_print.setToolTip("چاپ یا ذخیره PDF، با ریز پکیج یا بدون ریز پکیج")
-            btn_print.clicked.connect(lambda _, cid=c_id: self._contract_print_flow(cid))
-            self.w_table.setCellWidget(r_idx, 12, btn_print)
+            btn_print.setStyleSheet("background-color:#2980b9; color:white; font-weight:bold; padding:3px;")
+            btn_print.setToolTip("چاپ A5 سیاه و سفید یا PDF رنگی، با/بدون ریز پکیج و نیروی کار")
+            btn_print.clicked.connect(lambda _, cid=d["id"]: self._contract_print_flow(cid))
+            self.w_table.setCellWidget(r_idx, 14, btn_print)
 
             btn_edit = QPushButton(ico("edit"))
             btn_edit.setToolTip("ویرایش قرارداد")
             btn_edit.setStyleSheet("background-color: #f39c12; color: white;")
-            btn_edit.clicked.connect(lambda _, cid=c_id: self.edit_wedding_contract(cid))
-            self.w_table.setCellWidget(r_idx, 13, btn_edit)
+            btn_edit.clicked.connect(lambda _, cid=d["id"]: self.edit_wedding_contract(cid))
+            self.w_table.setCellWidget(r_idx, 15, btn_edit)
 
             btn_del = QPushButton(ico("delete"))
             btn_del.setToolTip("حذف قرارداد")
             btn_del.setStyleSheet("background-color: #e74c3c; color: white;")
-            btn_del.clicked.connect(lambda _, cid=c_id: self.delete_wedding_contract(cid))
-            self.w_table.setCellWidget(r_idx, 14, btn_del)
+            btn_del.clicked.connect(lambda _, cid=d["id"]: self.delete_wedding_contract(cid))
+            self.w_table.setCellWidget(r_idx, 16, btn_del)
 
         self.refresh_dashboard_summary()
 
@@ -5084,6 +6075,7 @@ class StudioAccountingApp(QMainWindow):
             self.load_inventory()
             self.load_staff_table()
             self.load_person_events()
+            self.refresh_settlement_cards()
 
     def delete_wedding_contract(self, contract_id):
         if QMessageBox.question(
@@ -5107,6 +6099,7 @@ class StudioAccountingApp(QMainWindow):
         self.load_inventory()
         self.load_staff_table()
         self.load_person_events()
+        self.refresh_settlement_cards()
 
     def on_wedding_double_click(self, index):
         row = index.row()
@@ -5129,8 +6122,8 @@ class StudioAccountingApp(QMainWindow):
         self.load_wedding_contracts()
 
     def export_wedding_pdf(self, contract_id):
-        """سازگاری با نسخه قبل: خروجی PDF با ریز پکیج"""
-        html, filename = InvoiceBuilder.build_wedding_invoice(contract_id, with_details=True)
+        """سازگاری با نسخه قبل: خروجی PDF رنگی با ریز پکیج"""
+        html, filename = InvoiceBuilder.build_wedding_invoice(contract_id, True, True, False)
         if not html:
             return
         path, _ = QFileDialog.getSaveFileName(self, "ذخیره فاکتور PDF", filename, "PDF Files (*.pdf)")
@@ -5143,8 +6136,8 @@ class StudioAccountingApp(QMainWindow):
             QMessageBox.critical(self, "خطا", f"خطا در ساخت PDF:\n{err}")
 
     def print_wedding(self, contract_id):
-        """سازگاری با نسخه قبل: چاپ فاکتور با ریز پکیج"""
-        html, _ = InvoiceBuilder.build_wedding_invoice(contract_id, with_details=True)
+        """سازگاری با نسخه قبل: چاپ A5 سیاه و سفید"""
+        html, _ = InvoiceBuilder.build_wedding_invoice(contract_id, True, True, True)
         if html:
             print_html_document(html, self, "فاکتور قرارداد عروس و داماد")
 
@@ -5226,7 +6219,7 @@ class StudioAccountingApp(QMainWindow):
         ])
         self.c_table.setAlternatingRowColors(True)
         self.c_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.c_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        persist_table(self.c_table, "commercial", QHeaderView.ResizeMode.ResizeToContents)
         self.c_table.verticalHeader().setDefaultSectionSize(34)
         self.c_table.doubleClicked.connect(self.on_commercial_double_click)
         t_layout.addWidget(self.c_table)
@@ -5244,7 +6237,7 @@ class StudioAccountingApp(QMainWindow):
         remain = max(0, amount - paid)
         self.c_lbl_words.setText(
             f"<b>مبلغ کل به حروف:</b> {number_to_persian_words(amount)} تومان<br>"
-            f"<b>مانده:</b> {remain:,} تومان &nbsp;|&nbsp; "
+            f"<b>مانده:</b> {remain:,} تومان  |  "
             f"<b>مانده به حروف:</b> {number_to_persian_words(remain)} تومان"
         )
 
@@ -5286,6 +6279,7 @@ class StudioAccountingApp(QMainWindow):
         self.load_commercial_projects()
         self.load_work_years()
         self.refresh_dashboard_summary()
+        self.refresh_settlement_cards()
 
     def load_commercial_projects(self):
         conn = sqlite3.connect(DB_NAME)
@@ -5342,6 +6336,8 @@ class StudioAccountingApp(QMainWindow):
             aw.setLayout(al)
             self.c_table.setCellWidget(r_idx, 10, aw)
 
+        self.refresh_settlement_cards()
+
     def edit_commercial_project(self, p_id):
         dlg = EditCommercialDialog(p_id, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
@@ -5377,7 +6373,7 @@ class StudioAccountingApp(QMainWindow):
             QMessageBox.critical(self, "خطا", f"خطا:\n{err}")
 
     def print_commercial(self, p_id):
-        html, _ = InvoiceBuilder.build_commercial_invoice(p_id)
+        html, _ = InvoiceBuilder.build_commercial_invoice(p_id, mono=True)
         if html:
             print_html_document(html, self, "فاکتور پروژه تبلیغاتی")
 
@@ -5394,6 +6390,7 @@ class StudioAccountingApp(QMainWindow):
         conn.commit()
         conn.close()
         self.load_commercial_projects()
+        self.refresh_settlement_cards()
 
     # ============================================================
     # ==============  تب ۳: پرسنل و کارکنان  ====================
@@ -5509,7 +6506,7 @@ class StudioAccountingApp(QMainWindow):
         ])
         self.events_table.setAlternatingRowColors(True)
         self.events_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.events_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        persist_table(self.events_table, "staff_events", QHeaderView.ResizeMode.Stretch)
         ev_layout.addWidget(self.events_table)
 
         self.lbl_events_sum = QLabel("")
@@ -5543,7 +6540,7 @@ class StudioAccountingApp(QMainWindow):
         ])
         self.staff_table.setAlternatingRowColors(True)
         self.staff_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.staff_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        persist_table(self.staff_table, "staff_payments", QHeaderView.ResizeMode.Stretch)
         pay_layout.addWidget(self.staff_table)
         pay_box.setLayout(pay_layout)
 
@@ -5742,7 +6739,7 @@ class StudioAccountingApp(QMainWindow):
             self.events_table.setItem(i, 5, QTableWidgetItem(f"{r[5]:,}"))
 
         self.lbl_events_sum.setText(
-            f"<b>تعداد مراسم‌های این فرد:</b> {len(rows)} &nbsp;|&nbsp; "
+            f"<b>تعداد مراسم‌های این فرد:</b> {len(rows)}  |  "
             f"<b>جمع حقوق قراردادی دریافتی:</b> {total_wage:,} تومان<br>"
             f"<b>به حروف:</b> {number_to_persian_words(total_wage)} تومان"
         )
@@ -5865,7 +6862,7 @@ class StudioAccountingApp(QMainWindow):
             return
         period = self.combo_report_period.currentText()
         html, _ = InvoiceBuilder.build_staff_report(
-            person_id, period=period, year=get_current_year())
+            person_id, period=period, year=get_current_year(), mono=True)
         if html:
             print_html_document(html, self, "ریز کارکرد پرسنل")
 
@@ -5874,12 +6871,39 @@ class StudioAccountingApp(QMainWindow):
     # ============================================================
     def setup_expenses_tab(self):
         layout = QHBoxLayout()
-        layout.setSpacing(10)
+        layout.setSpacing(8)
+
+        left = QVBoxLayout()
+        left.setSpacing(8)
+
+        # ---------- کارت‌های وضعیت تسویه پروژه‌ها ----------
+        settle_box = QGroupBox("وضعیت تسویه پروژه‌ها (برای دیدن لیست هر دسته، روی آن کلیک کنید)")
+        settle_box.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(6)
+        self.settle_cards = {}
+        for key, title, color in (
+            ("all", "کل پروژه‌ها", "#2c3e50"),
+            ("full", "تسویه کامل", "#1e8449"),
+            ("partial", "تسویه ناقص", "#e67e22"),
+            ("none", "تسویه نشده", "#c0392b"),
+        ):
+            b = QPushButton(title)
+            b.setMinimumHeight(60)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(f"background-color:{color}; color:white; font-weight:bold; "
+                            f"font-size:9.5pt; border-radius:10px; padding:5px;")
+            b.clicked.connect(lambda _, k=key: self.show_settlement_list(k))
+            self.settle_cards[key] = b
+            b._title = title
+            cards_row.addWidget(b)
+        settle_box.setLayout(cards_row)
+        left.addWidget(settle_box)
 
         form_box = QGroupBox("ثبت هزینه جدید")
         form_box.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
         form_layout = QFormLayout()
-        form_layout.setSpacing(7)
+        form_layout.setSpacing(6)
 
         self.exp_code = QLineEdit()
         self.exp_code.setPlaceholderText("خالی بگذارید تا کد یکتا ساخته شود")
@@ -5896,7 +6920,7 @@ class StudioAccountingApp(QMainWindow):
         self.exp_amount.textChanged.connect(self.update_expense_words)
         self.exp_date = PersianDateEdit(date_str=jalali_today_str())
         self.exp_desc = QTextEdit()
-        self.exp_desc.setFixedHeight(60)
+        self.exp_desc.setFixedHeight(56)
 
         form_layout.addRow(f"{ico('list')} کد هزینه (یکتا):", self.exp_code)
         form_layout.addRow(f"{ico('expenses')} عنوان هزینه <span style='color:red;'>*</span>:", self.exp_title)
@@ -5908,16 +6932,21 @@ class StudioAccountingApp(QMainWindow):
         self.exp_lbl_words = QLabel("")
         self.exp_lbl_words.setWordWrap(True)
         self.exp_lbl_words.setStyleSheet("background-color:#fdedec; border:1px solid #c0392b; "
-                                         "border-radius:8px; padding:9px; font-size:10pt;")
+                                         "border-radius:8px; padding:8px; font-size:9.5pt;")
         form_layout.addRow(self.exp_lbl_words)
 
         btn_save = QPushButton(ico_text("save", "ثبت هزینه"))
-        btn_save.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; padding: 10px;")
+        btn_save.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; padding: 9px;")
         btn_save.clicked.connect(self.save_expense)
         form_layout.addRow(btn_save)
 
         form_box.setLayout(form_layout)
-        layout.addWidget(form_box, 2)
+        left.addWidget(form_box)
+        left.addStretch()
+
+        left_wrap = QWidget()
+        left_wrap.setLayout(left)
+        layout.addWidget(left_wrap, 3)
 
         table_box = QGroupBox("لیست هزینه‌ها")
         table_box.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
@@ -5927,7 +6956,7 @@ class StudioAccountingApp(QMainWindow):
         btn_refresh = QPushButton(ico_text("refresh", "بروزرسانی"))
         btn_refresh.clicked.connect(self.load_expenses_table)
         btn_excel = QPushButton(ico_text("excel", "خروجی اکسل"))
-        btn_excel.setStyleSheet("background-color:#1e8449; color:white; font-weight:bold; padding:7px;")
+        btn_excel.setStyleSheet("background-color:#1e8449; color:white; font-weight:bold; padding:6px;")
         btn_excel.clicked.connect(lambda: self.export_table_excel(
             self.exp_table, "هزینه‌ها", f"هزینه‌ها_{get_current_year()}.xlsx"))
         tools.addWidget(btn_refresh)
@@ -5943,14 +6972,71 @@ class StudioAccountingApp(QMainWindow):
         ])
         self.exp_table.setAlternatingRowColors(True)
         self.exp_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.exp_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.exp_table.verticalHeader().setDefaultSectionSize(34)
+        self.exp_table.verticalHeader().setDefaultSectionSize(30)
+        persist_table(self.exp_table, "expenses", QHeaderView.ResizeMode.Stretch)
         t_layout.addWidget(self.exp_table)
         table_box.setLayout(t_layout)
-        layout.addWidget(table_box, 5)
+        layout.addWidget(table_box, 6)
 
         self.tab_expenses.setLayout(layout)
         self.load_expenses_table()
+        self.refresh_settlement_cards()
+
+    # ---------------- کارت‌های وضعیت تسویه ----------------
+    def _project_settlements(self):
+        """فهرست وضعیت تسویه همه قراردادها و پروژه‌های سال کاری جاری"""
+        work_year = get_current_year()
+        out = []
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("""SELECT code, groom_name, bride_name, ceremony_date,
+                                     total_amount, discount, paid_amount
+                              FROM wedding_contracts WHERE work_year=?""", (work_year,))
+            for r in cursor.fetchall():
+                net = max(0, (r[4] or 0) - (r[5] or 0))
+                state, remain = settlement_state(net, r[6])
+                out.append({"kind": "قرارداد", "code": r[0],
+                            "title": f"{r[1]} و {r[2]}", "date": r[3],
+                            "net": net, "paid": r[6] or 0, "remain": remain, "state": state})
+            cursor.execute("""SELECT code, title, client_name, project_date,
+                                     total_amount, paid_amount
+                              FROM commercial_projects WHERE work_year=?""", (work_year,))
+            for r in cursor.fetchall():
+                net = r[4] or 0
+                state, remain = settlement_state(net, r[5])
+                out.append({"kind": "پروژه", "code": r[0],
+                            "title": f"{r[1]} - {r[2] or '-'}", "date": r[3],
+                            "net": net, "paid": r[5] or 0, "remain": remain, "state": state})
+            conn.close()
+        except Exception as e:
+            print("[SETTLE] error:", e)
+        return out
+
+    def refresh_settlement_cards(self):
+        """به‌روزرسانی تعداد و مانده هر دسته روی کارت‌ها"""
+        if not getattr(self, "settle_cards", None):
+            return
+        try:
+            data = self._project_settlements()
+            counts = {"all": len(data), "full": 0, "partial": 0, "none": 0}
+            sums = {"all": 0, "full": 0, "partial": 0, "none": 0}
+            for d in data:
+                sums["all"] += d["remain"]
+                key = {"تسویه کامل": "full", "تسویه ناقص": "partial",
+                       "تسویه نشده": "none"}.get(d["state"], "none")
+                counts[key] += 1
+                sums[key] += d["remain"]
+            for key, btn in self.settle_cards.items():
+                title = getattr(btn, "_title", key)
+                btn.setText(f"{title}\n{counts[key]} مورد\nمانده: {sums[key]:,} تومان")
+        except Exception as e:
+            print("[SETTLE] refresh error:", e)
+
+    def show_settlement_list(self, kind):
+        dlg = SettlementStatusDialog(kind, self)
+        dlg.exec()
+        self.refresh_settlement_cards()
 
     def update_expense_words(self):
         if not hasattr(self, "exp_lbl_words"):
@@ -5997,6 +7083,7 @@ class StudioAccountingApp(QMainWindow):
         self.exp_date.set_date(jalali_today_str())
         self.load_expenses_table()
         self.calculate_financial_report()
+        self.refresh_settlement_cards()
 
     def load_expenses_table(self):
         if not hasattr(self, "exp_table"):
@@ -6033,7 +7120,8 @@ class StudioAccountingApp(QMainWindow):
             btn_del.clicked.connect(lambda _, x=eid: self.delete_expense(x))
             self.exp_table.setCellWidget(r_idx, 7, btn_del)
 
-    def expense_html(self, eid):
+    def expense_html(self, eid, mono=False):
+        p = doc_palette(mono)
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("SELECT code, title, category, amount, date_str, description "
@@ -6044,44 +7132,39 @@ class StudioAccountingApp(QMainWindow):
             return None
         studio_name, studio_phone, studio_address = InvoiceBuilder._studio_info()
         now = jdatetime.datetime.now()
+
+        def pair(label, value):
+            return InvoiceBuilder._row([
+                InvoiceBuilder._td(f"<b>{label}</b>", align="right",
+                                   bg=p["box_bg"], size="8.5pt", width="26%"),
+                InvoiceBuilder._td(value, align="right", size="8.5pt"),
+            ])
+
+        rows = (
+            pair("کد:", r[0] or "-") +
+            pair("عنوان:", r[1]) +
+            pair("دسته‌بندی:", r[2]) +
+            pair("مبلغ:", f"<b>{r[3]:,}</b> تومان") +
+            pair("مبلغ به حروف:", f"{number_to_persian_words(r[3])} تومان") +
+            pair("تاریخ:", r[4] or "-") +
+            pair("توضیحات:", r[5] or "-")
+        )
+
         return f"""
-        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:11pt;">
-          <table width="100%"  style="border-collapse:collapse">
-            <tr style="background-color:#a93226;"><td style="padding:14px; text-align:center; color:#ffffff;">
-              <div style="font-size:21pt; font-weight:bold;">{studio_name}</div>
-              <div style="font-size:12pt;">رسید هزینه</div>
-            </td>
-            <td width="30%"  style="padding:14px;color:#ffffff;font-size:9pt;text-align:left">
-              <div>تاریخ چاپ: {now.strftime('%Y/%m/%d')}</div>
-              <div>ساعت: {now.strftime('%H:%M')}</div>
-            </td></tr>
-          </table>
-          <table width="100%"  style="border-collapse:collapse;margin-top:14px">
-            <tr><td width="28%"  style="border:1px solid #9bb0c4;background-color:#fdedec;padding:9px"><b>کد:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;">{r[0] or '-'}</td></tr>
-            <tr><td style="border:1px solid #9bb0c4; background-color:#fdedec; padding:9px;"><b>عنوان:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;">{r[1]}</td></tr>
-            <tr><td style="border:1px solid #9bb0c4; background-color:#fdedec; padding:9px;"><b>دسته‌بندی:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;">{r[2]}</td></tr>
-            <tr><td style="border:1px solid #9bb0c4; background-color:#fdedec; padding:9px;"><b>مبلغ:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;"><b>{r[3]:,}</b> تومان</td></tr>
-            <tr><td style="border:1px solid #9bb0c4; background-color:#fdedec; padding:9px;"><b>مبلغ به حروف:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;">{number_to_persian_words(r[3])} تومان</td></tr>
-            <tr><td style="border:1px solid #9bb0c4; background-color:#fdedec; padding:9px;"><b>تاریخ:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;">{r[4] or '-'}</td></tr>
-            <tr><td style="border:1px solid #9bb0c4; background-color:#fdedec; padding:9px;"><b>توضیحات:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;">{r[5] or '-'}</td></tr>
-          </table>
-          <div style="text-align:center; margin-top:60px; font-size:11pt;">مهر و امضای حسابداری</div>
-          <div style="text-align:center; margin-top:24px; font-size:8pt; color:#7f8c8d; border-top:1px solid #cfdbe8; padding-top:8px;">
-            {studio_name} &nbsp;|&nbsp; تلفن: {studio_phone}
-            {('&nbsp;|&nbsp; ' + studio_address) if studio_address else ''}
+        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:9pt;">
+          {InvoiceBuilder._title_band(
+              p, studio_name, "<div style='font-size:10pt;'>رسید هزینه</div>",
+              [f"تاریخ چاپ: {now.strftime('%Y/%m/%d')}", f"ساعت: {now.strftime('%H:%M')}"])}
+          <table width="100%" style="border-collapse:collapse; margin-top:6px;">{rows}</table>
+          <div style="text-align:center; margin-top:34px; font-size:9pt;">مهر و امضای حسابداری</div>
+          <div style="text-align:center; margin-top:10px; font-size:7pt; color:{p['muted']};">
+            {studio_name} | تلفن: {studio_phone}{(' | ' + studio_address) if studio_address else ''}
           </div>
         </div>
         """
 
     def print_expense(self, eid):
-        html = self.expense_html(eid)
+        html = self.expense_html(eid, mono=True)
         if html:
             print_html_document(html, self, "رسید هزینه")
 
@@ -6094,6 +7177,7 @@ class StudioAccountingApp(QMainWindow):
         conn.commit()
         conn.close()
         self.load_expenses_table()
+        self.refresh_settlement_cards()
 
     # ============================================================
     # ==============  تب ۵: گزارش مالی جامع  ====================
@@ -6153,6 +7237,12 @@ class StudioAccountingApp(QMainWindow):
             ("نمودار حقوق و پرداختی پرسنل", "staff_salaries"),
             ("نمودار وضعیت موجودی انبار تجهیزات", "inventory_status"),
             ("نمودار وضعیت چک‌های دریافتی و پرداختی", "checks_status"),
+            ("نمودار پلکانی درآمد ماهانه", "monthly_step"),
+            ("نمودار نقطه‌ای مبلغ مراسم", "scatter"),
+            ("نمودار خطی روند درآمد و هزینه", "line_trend"),
+            ("نمودار دونات هزینه‌ها", "donut"),
+            ("نمودار انباشته درآمد و هزینه", "stacked"),
+            ("نمودار سطحی روند انباشته سود", "area"),
         ]
         for title, _key in self.chart_kinds:
             self.combo_chart_kind.addItem(f"{ico('chart')} {title}")
@@ -6174,7 +7264,7 @@ class StudioAccountingApp(QMainWindow):
         ])
         self.rep_table.setAlternatingRowColors(True)
         self.rep_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.rep_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        persist_table(self.rep_table, "financial_report", QHeaderView.ResizeMode.Stretch)
         layout.addWidget(self.rep_table)
 
         self.tab_reports.setLayout(layout)
@@ -6230,9 +7320,9 @@ class StudioAccountingApp(QMainWindow):
         profit = total_in - total_out
 
         self.lbl_rep_summary.setText(
-            f"<b>سال کاری {work_year}</b> &nbsp;|&nbsp; "
-            f"ورودی کل: <b>{total_in:,}</b> تومان &nbsp;|&nbsp; "
-            f"خروجی کل: <b>{total_out:,}</b> تومان &nbsp;|&nbsp; "
+            f"<b>سال کاری {work_year}</b>  |  "
+            f"ورودی کل: <b>{total_in:,}</b> تومان  |  "
+            f"خروجی کل: <b>{total_out:,}</b> تومان  |  "
             f"سود خالص: <span style='color:{'#27ae60' if profit >= 0 else '#c0392b'};'>"
             f"<b>{profit:,}</b> تومان</span><br>"
             f"<b>سود خالص به حروف:</b> {number_to_persian_words(abs(profit))} تومان "
@@ -6265,8 +7355,8 @@ class StudioAccountingApp(QMainWindow):
                                "WHERE person_id=? AND work_year=?", (person_id, work_year))
                 total_person = cursor.fetchone()[0]
                 self.lbl_rep_summary.setText(
-                    f"<b>گزارش فردی:</b> {p[0]} ({p[1]}) &nbsp;|&nbsp; "
-                    f"<b>جمع کل پرداختی:</b> {total_person:,} تومان &nbsp;|&nbsp; "
+                    f"<b>گزارش فردی:</b> {p[0]} ({p[1]})  |  "
+                    f"<b>جمع کل پرداختی:</b> {total_person:,} تومان  |  "
                     f"<b>تعداد تراکنش:</b> {len(trans)}<br>"
                     f"<b>به حروف:</b> {number_to_persian_words(total_person)} تومان"
                 )
@@ -6457,8 +7547,158 @@ class StudioAccountingApp(QMainWindow):
                          fontsize=13, fontweight="bold", pad=14, color="#1F4E78")
             ax.axis("equal")
 
+        elif kind == "monthly_step":
+            wedding, comm, exp = self._monthly_series()
+            months = [fa_shape(jalali_month_name(m)) for m in range(1, 13)][::-1]
+            values = [(wedding[m] + comm[m]) for m in range(1, 13)][::-1]
+            xs = list(range(len(values)))
+            ax.step(xs, values, where="mid", color="#2980b9", linewidth=2.4)
+            ax.fill_between(xs, values, step="mid", color="#2980b9", alpha=0.16)
+            ax.set_xticks(xs)
+            ax.set_xticklabels(months, fontsize=8)
+            self._style_axes(ax, money_axis="y")
+            ax.set_title(fa_shape(f"نمودار پلکانی درآمد ماهانه - سال {wy}"),
+                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
+            ax.set_ylabel(fa_shape("مبلغ (تومان)"), fontsize=10)
+
+        elif kind == "scatter":
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("""SELECT ceremony_date, total_amount, discount FROM wedding_contracts
+                              WHERE work_year=?""", (wy,))
+            pts = cursor.fetchall()
+            conn.close()
+            xs, ys = [], []
+            for d, raw, disc in pts:
+                jd = parse_jalali(d)
+                if jd:
+                    xs.append(jd.month + jd.day / 31.0)
+                    ys.append(max(0, (raw or 0) - (disc or 0)))
+            ax.scatter(xs, ys, s=70, color="#8e44ad", edgecolor="#5b2c8e", alpha=0.8)
+            ax.set_xticks(range(1, 13))
+            ax.set_xticklabels([fa_shape(jalali_month_name(m)) for m in range(1, 13)], fontsize=8)
+            self._style_axes(ax, money_axis="y")
+            ax.set_title(fa_shape(f"نمودار نقطه‌ای مبلغ مراسم به تفکیک ماه - سال {wy}"),
+                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
+            ax.set_ylabel(fa_shape("مبلغ قرارداد (تومان)"), fontsize=10)
+
+        elif kind == "line_trend":
+            wedding, comm, exp = self._monthly_series()
+            months = [fa_shape(jalali_month_name(m)) for m in range(1, 13)][::-1]
+            income = [(wedding[m] + comm[m]) for m in range(1, 13)][::-1]
+            costs = [exp[m] for m in range(1, 13)][::-1]
+            xs = list(range(len(months)))
+            ax.plot(xs, income, marker="o", linewidth=2.2, color="#1e8449",
+                    label=fa_shape("درآمد"))
+            ax.plot(xs, costs, marker="s", linewidth=2.2, color="#c0392b",
+                    label=fa_shape("هزینه"))
+            ax.set_xticks(xs)
+            ax.set_xticklabels(months, fontsize=8)
+            self._style_axes(ax, money_axis="y")
+            ax.legend(fontsize=9, frameon=False)
+            ax.set_title(fa_shape(f"نمودار خطی روند درآمد و هزینه - سال {wy}"),
+                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
+            ax.set_ylabel(fa_shape("مبلغ (تومان)"), fontsize=10)
+
+        elif kind == "donut":
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("SELECT category, COALESCE(SUM(amount),0) FROM expenses "
+                           "WHERE work_year=? GROUP BY category ORDER BY 2 DESC", (wy,))
+            rows = cursor.fetchall()
+            conn.close()
+            if not rows:
+                labels, amounts = [fa_shape("هزینه‌ای ثبت نشده")], [1]
+                colors = ["#dfe6e9"]
+            else:
+                labels = [fa_shape(r[0] or "-") for r in rows]
+                amounts = [r[1] for r in rows]
+                colors = list(plt.cm.Pastel1(range(len(rows))))
+            wedges, _t, _a = ax.pie(amounts, labels=None, autopct=lambda p: f"{p:.1f}%",
+                                    colors=colors, startangle=90,
+                                    wedgeprops=dict(width=0.42, edgecolor="white"),
+                                    textprops={"fontsize": 8.5})
+            ax.legend(wedges, labels, loc="center right", bbox_to_anchor=(1.12, 0.5),
+                      fontsize=8.5, frameon=False)
+            ax.set_title(fa_shape(f"نمودار دونات هزینه‌ها به تفکیک دسته - سال {wy}"),
+                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
+            ax.axis("equal")
+
+        elif kind == "stacked":
+            wedding, comm, exp = self._monthly_series()
+            months = [fa_shape(jalali_month_name(m)) for m in range(1, 13)][::-1]
+            xs = list(range(len(months)))
+            w_vals = [wedding[m] for m in range(1, 13)][::-1]
+            c_vals = [comm[m] for m in range(1, 13)][::-1]
+            e_vals = [exp[m] for m in range(1, 13)][::-1]
+            ax.bar(xs, w_vals, color="#27ae60", edgecolor="#1e8449", width=0.62,
+                   label=fa_shape("درآمد عروسی"))
+            ax.bar(xs, c_vals, bottom=w_vals, color="#2980b9", edgecolor="#1F4E78",
+                   width=0.62, label=fa_shape("درآمد تبلیغاتی"))
+            ax.bar(xs, e_vals, color="#c0392b", edgecolor="#a93226", width=0.32,
+                   label=fa_shape("هزینه‌ها"))
+            ax.set_xticks(xs)
+            ax.set_xticklabels(months, fontsize=8)
+            self._style_axes(ax, money_axis="y")
+            ax.legend(fontsize=8.5, frameon=False, ncol=3)
+            ax.set_title(fa_shape(f"نمودار انباشته درآمد و هزینه ماهانه - سال {wy}"),
+                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
+            ax.set_ylabel(fa_shape("مبلغ (تومان)"), fontsize=10)
+
+        elif kind == "area":
+            wedding, comm, exp = self._monthly_series()
+            months = [fa_shape(jalali_month_name(m)) for m in range(1, 13)][::-1]
+            xs = list(range(len(months)))
+            profit = [(wedding[m] + comm[m] - exp[m]) for m in range(1, 13)][::-1]
+            cum = []
+            run = 0
+            for p_ in profit:
+                run += p_
+                cum.append(run)
+            ax.fill_between(xs, cum, color="#16a085", alpha=0.35)
+            ax.plot(xs, cum, color="#0e6655", linewidth=2.4, marker="o", markersize=4)
+            ax.axhline(0, color="#7f8c8d", linewidth=1, linestyle="--")
+            ax.set_xticks(xs)
+            ax.set_xticklabels(months, fontsize=8)
+            self._style_axes(ax, money_axis="y")
+            ax.set_title(fa_shape(f"نمودار سطحی روند انباشته سود - سال {wy}"),
+                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
+            ax.set_ylabel(fa_shape("سود انباشته (تومان)"), fontsize=10)
+
         fig.tight_layout()
         return fig
+
+    def _monthly_series(self):
+        """درآمد عروسی، درآمد تبلیغاتی و هزینه‌ها به تفکیک ماه شمسی"""
+        wy = get_current_year()
+        wedding = [0] * 13
+        comm = [0] * 13
+        exp = [0] * 13
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("SELECT ceremony_date, total_amount, discount FROM wedding_contracts "
+                           "WHERE work_year=?", (wy,))
+            for d, raw, disc in cursor.fetchall():
+                jd = parse_jalali(d)
+                if jd and 1 <= jd.month <= 12:
+                    wedding[jd.month] += max(0, (raw or 0) - (disc or 0))
+            cursor.execute("SELECT project_date, total_amount FROM commercial_projects "
+                           "WHERE work_year=?", (wy,))
+            for d, amt in cursor.fetchall():
+                jd = parse_jalali(d)
+                if jd and 1 <= jd.month <= 12:
+                    comm[jd.month] += (amt or 0)
+            cursor.execute("SELECT date_str, amount FROM expenses WHERE work_year=?", (wy,))
+            for d, amt in cursor.fetchall():
+                jd = parse_jalali(d)
+                if jd and 1 <= jd.month <= 12:
+                    exp[jd.month] += (amt or 0)
+            conn.close()
+        except Exception as e:
+            print("[CHART] monthly series error:", e)
+        return wedding, comm, exp
+
 
     def show_financial_chart(self):
         """نمایش نمودار انتخابی با عنوان فارسی درست (رفع برعکس و جدا بودن حروف)"""
@@ -6474,7 +7714,8 @@ class StudioAccountingApp(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "خطا در نمودار", f"ساخت نمودار ناموفق بود:\n{e}")
 
-    def financial_report_html(self):
+    def financial_report_html(self, mono=False):
+        p = doc_palette(mono)
         t = self._report_totals()
         wy = t["year"]
         total_in, total_out = t["total_in"], t["total_out"]
@@ -6482,80 +7723,56 @@ class StudioAccountingApp(QMainWindow):
         studio_name, studio_phone, studio_address = InvoiceBuilder._studio_info()
         now = jdatetime.datetime.now()
 
-        def row(i, title, kind, amount, bg="#ffffff"):
-            return f"""<tr style="background-color:{bg};">
-                <td style="border:1px solid #9bb0c4; padding:7px; text-align:center;">{i}</td>
-                <td style="border:1px solid #9bb0c4; padding:7px;">{title}</td>
-                <td style="border:1px solid #9bb0c4; padding:7px; text-align:center;">{kind}</td>
-                <td style="border:1px solid #9bb0c4; padding:7px; text-align:center;">{amount:,}</td>
-            </tr>"""
+        def row(i, title, kind, amount, bg=None):
+            return InvoiceBuilder._row([
+                InvoiceBuilder._td(str(i), size="8pt", bg=bg),
+                InvoiceBuilder._td(title, align="right", size="8pt", bg=bg),
+                InvoiceBuilder._td(kind, size="8pt", bg=bg),
+                InvoiceBuilder._td(f"{amount:,}", size="8pt", bg=bg),
+            ])
 
-        rows = (
-            row(1, "قراردادهای عروس و داماد (قیمت خام)", "درآمد", t["w_raw"]) +
-            row(2, "تخفیف داده‌شده به مشتریان", "کاهش درآمد", t["w_disc"], "#fdedec") +
-            row(3, "قراردادهای عروس و داماد (بعد از تخفیف)", "درآمد", t["w_net"], "#eafaf1") +
-            row(4, "پروژه‌های تبلیغاتی / بیوتی / تولدی", "درآمد", t["c_in"]) +
-            row(5, "هزینه‌های جاری و قبوض", "هزینه", t["exp_out"], "#fdedec") +
-            row(6, "حقوق و پرداختی پرسنل", "هزینه", t["staff_out"], "#fdedec")
-        )
+        rows = (row(1, "قراردادهای عروس و داماد (قیمت خام)", "درآمد", t["w_raw"]) +
+                row(2, "تخفیف داده‌شده به مشتریان", "کاهش درآمد", t["w_disc"], p["alt_row"]) +
+                row(3, "قراردادهای عروس و داماد (بعد از تخفیف)", "درآمد", t["w_net"]) +
+                row(4, "پروژه‌های تبلیغاتی / بیوتی / تولدی", "درآمد", t["c_in"]) +
+                row(5, "هزینه‌های جاری و قبوض", "هزینه", t["exp_out"], p["alt_row"]) +
+                row(6, "حقوق و پرداختی پرسنل", "هزینه", t["staff_out"], p["alt_row"]))
+
+        summary = InvoiceBuilder._row([
+            InvoiceBuilder._td(f"<b>ورودی کل</b><br>{total_in:,} تومان", align="center",
+                               bg=p["alt_row"], size="8.5pt"),
+            InvoiceBuilder._td(f"<b>خروجی کل</b><br>{total_out:,} تومان", align="center",
+                               bg=p["box_bg"], size="8.5pt"),
+            InvoiceBuilder._td(f"<b>سود خالص</b><br>{profit:,} تومان", align="center",
+                               bg=p["total_bg"], size="9pt", bold=True),
+        ])
 
         return f"""
-        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:10pt;">
-          <table width="100%"  style="border-collapse:collapse">
-            <tr style="background-color:#1F4E78;">
-              <td style="padding:14px; text-align:center; color:#ffffff;">
-                <div style="font-size:21pt; font-weight:bold;">{studio_name}</div>
-                <div style="font-size:12pt;">گزارش مالی جامع - سال کاری {wy}</div>
-              </td>
-              <td width="26%"  style="padding:14px;color:#ffffff;font-size:9pt;text-align:left">
-                <div>تاریخ چاپ: {now.strftime('%Y/%m/%d')}</div>
-                <div>ساعت: {now.strftime('%H:%M')}</div>
-                <div>تعداد پرسنل: {t['persons']}</div>
-              </td>
-            </tr>
-          </table>
-
-          <table width="100%"  style="border-collapse:collapse;margin-top:14px">
-            <thead>
-              <tr style="background-color:#2C6699; color:#ffffff;">
-                <th width="7%"  style="border:1px solid #9bb0c4;padding:7px">ردیف</th>
-                <th style="border:1px solid #9bb0c4; padding:7px;">بخش</th>
-                <th width="16%"  style="border:1px solid #9bb0c4;padding:7px">نوع</th>
-                <th width="22%"  style="border:1px solid #9bb0c4;padding:7px">مبلغ (تومان)</th>
-              </tr>
-            </thead>
+        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:9pt;">
+          {InvoiceBuilder._title_band(
+              p, studio_name,
+              f"<div style='font-size:10pt;'>گزارش مالی جامع - سال کاری {wy}</div>",
+              [f"تاریخ چاپ: {now.strftime('%Y/%m/%d')}", f"ساعت: {now.strftime('%H:%M')}",
+               f"تعداد پرسنل: {t['persons']}"])}
+          <table width="100%" style="border-collapse:collapse; margin-top:5px;">
+            <thead>{InvoiceBuilder._head(['ردیف', 'بخش', 'نوع', 'مبلغ (تومان)'],
+                                         bg=p['table_head'], fg=p['table_head_fg'])}</thead>
             <tbody>{rows}</tbody>
           </table>
-
-          <table width="100%"  style="border-collapse:collapse;margin-top:14px">
-            <tr>
-              <td style="border:1px solid #9bb0c4; padding:10px; background-color:#eafaf1; text-align:center;">
-                <b>ورودی کل:</b><br>{total_in:,} تومان
-              </td>
-              <td style="border:1px solid #9bb0c4; padding:10px; background-color:#fdedec; text-align:center;">
-                <b>خروجی کل:</b><br>{total_out:,} تومان
-              </td>
-              <td style="border:1px solid #9bb0c4; padding:10px; background-color:{'#eafaf1' if profit >= 0 else '#fdedec'}; text-align:center;">
-                <b>سود خالص:</b><br>{profit:,} تومان
-              </td>
-            </tr>
-          </table>
-
-          <div style="margin-top:10px; font-size:10pt;">
+          <table width="100%" style="border-collapse:collapse; margin-top:5px;">{summary}</table>
+          <div style="margin-top:6px; font-size:8.5pt;">
             <b>سود خالص به حروف:</b> {number_to_persian_words(abs(profit))} تومان
             {'' if profit >= 0 else '(زیان)'}
           </div>
-
-          <div style="text-align:center; margin-top:50px; font-size:11pt;">مهر و امضای مدیر / حسابداری</div>
-          <div style="text-align:center; margin-top:20px; font-size:8pt; color:#7f8c8d; border-top:1px solid #cfdbe8; padding-top:8px;">
-            {studio_name} &nbsp;|&nbsp; تلفن: {studio_phone}
-            {('&nbsp;|&nbsp; ' + studio_address) if studio_address else ''}
+          <div style="text-align:center; margin-top:30px; font-size:9pt;">مهر و امضای مدیر / حسابداری</div>
+          <div style="text-align:center; margin-top:10px; font-size:7pt; color:{p['muted']};">
+            {studio_name} | تلفن: {studio_phone}{(' | ' + studio_address) if studio_address else ''}
           </div>
         </div>
         """
 
     def print_financial_report(self):
-        self._output_flow(lambda with_details: self.financial_report_html(),
+        self._output_flow(lambda wd, ws, mono: self.financial_report_html(mono),
                           f"گزارش_مالی_{get_current_year()}.pdf",
                           "گزارش مالی جامع", allow_details=False)
 
@@ -6614,7 +7831,7 @@ class StudioAccountingApp(QMainWindow):
         ])
         self.search_table.setAlternatingRowColors(True)
         self.search_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.search_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        persist_table(self.search_table, "search_results", QHeaderView.ResizeMode.Stretch)
         self.search_table.doubleClicked.connect(self.on_search_double_click)
         layout.addWidget(self.search_table)
 
@@ -7010,8 +8227,8 @@ class StudioAccountingApp(QMainWindow):
         ])
         self.inv_table.setAlternatingRowColors(True)
         self.inv_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.inv_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.inv_table.verticalHeader().setDefaultSectionSize(38)
+        persist_table(self.inv_table, "inventory", QHeaderView.ResizeMode.ResizeToContents)
+        self.inv_table.verticalHeader().setDefaultSectionSize(36)
         layout.addWidget(self.inv_table, 1)
 
         self.tab_inventory.setLayout(layout)
@@ -7142,9 +8359,9 @@ class StudioAccountingApp(QMainWindow):
             self.inv_table.setCellWidget(r_idx, 8, btn_del)
 
         self.lbl_inv_summary.setText(
-            f"<b>تعداد اقلام:</b> {len(rows)} &nbsp;|&nbsp; "
-            f"<b>جمع موجودی (تعداد):</b> {total_count_sum} &nbsp;|&nbsp; "
-            f"<b>جمع موجودی قابل استفاده:</b> {total_remain_sum} &nbsp;|&nbsp; "
+            f"<b>تعداد اقلام:</b> {len(rows)}  |  "
+            f"<b>جمع موجودی (تعداد):</b> {total_count_sum}  |  "
+            f"<b>جمع موجودی قابل استفاده:</b> {total_remain_sum}  |  "
             f"<b>ارزش ریالی موجودی:</b> {total_value:,} تومان"
             + (f"<br><b style='color:#c0392b;'>⚠️ موجودی کم / تمام‌شده:</b> "
                f"{'، '.join(low_stock)}" if low_stock else "")
@@ -7211,7 +8428,8 @@ class StudioAccountingApp(QMainWindow):
         self.load_inventory()
         self.load_item_checkboxes()
 
-    def inventory_html(self):
+    def inventory_html(self, mono=False):
+        p = doc_palette(mono)
         studio_name, studio_phone, _addr = InvoiceBuilder._studio_info()
         now = jdatetime.datetime.now()
         conn = sqlite3.connect(DB_NAME)
@@ -7226,73 +8444,67 @@ class StudioAccountingApp(QMainWindow):
 
         body = ""
         total_value = 0
-        for idx, (name, code, total, used, price, category, note) in enumerate(rows):
+        total_count = total_used = total_remain = 0
+        for idx, (name, code, total, used, price, category, note) in enumerate(rows, start=1):
             total = total or 0
             used = used or 0
             remain = max(0, total - used)
             price = price or 0
             total_value += remain * price
-            body += f"""<tr>
-                <td style="border:1px solid #9bb0c4; padding:6px; text-align:center;">{idx+1}</td>
-                <td style="border:1px solid #9bb0c4; padding:6px; text-align:center;">{code or '-'}</td>
-                <td style="border:1px solid #9bb0c4; padding:6px;">{name}</td>
-                <td style="border:1px solid #9bb0c4; padding:6px; text-align:center;">{category or '-'}</td>
-                <td style="border:1px solid #9bb0c4; padding:6px; text-align:center;">{total}</td>
-                <td style="border:1px solid #9bb0c4; padding:6px; text-align:center;">{used}</td>
-                <td style="border:1px solid #9bb0c4; padding:6px; text-align:center; color:{'#c0392b' if remain <= 1 else '#1e8449'};"><b>{remain}</b></td>
-                <td style="border:1px solid #9bb0c4; padding:6px; text-align:center;">{price:,}</td>
-                <td style="border:1px solid #9bb0c4; padding:6px;">{note or '-'}</td>
-            </tr>"""
+            total_count += total
+            total_used += used
+            total_remain += remain
+            body += InvoiceBuilder._row([
+                InvoiceBuilder._td(str(idx), size="7.5pt"),
+                InvoiceBuilder._td(code or "-", size="7pt"),
+                InvoiceBuilder._td(name, align="right", size="7.5pt"),
+                InvoiceBuilder._td(category or "-", size="7pt"),
+                InvoiceBuilder._td(str(total), size="7.5pt"),
+                InvoiceBuilder._td(str(used), size="7.5pt"),
+                InvoiceBuilder._td(f"<b>{remain}</b>", size="7.5pt"),
+                InvoiceBuilder._td(f"{price:,}", size="7.5pt"),
+                InvoiceBuilder._td(note or "-", align="right", size="7pt"),
+            ])
         if not body:
-            body = ("<tr><td colspan='9' style='border:1px solid #9bb0c4; padding:8px; "
-                    "text-align:center;'>انبار خالی است</td></tr>")
+            body = f"<tr>{InvoiceBuilder._td('انبار خالی است', colspan=9, size='9pt')}</tr>"
 
         return f"""
         <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:9pt;">
-          <table width="100%"  style="border-collapse:collapse">
-            <tr style="background-color:#2c3e50;">
-              <td style="padding:14px; text-align:center; color:#ffffff;">
-                <div style="font-size:21pt; font-weight:bold;">{studio_name}</div>
-                <div style="font-size:12pt;">لیست انبار تجهیزات</div>
-              </td>
-              <td width="26%"  style="padding:14px;color:#ffffff;font-size:9pt;text-align:left">
-                <div>تاریخ چاپ: {now.strftime('%Y/%m/%d')}</div>
-                <div>ساعت: {now.strftime('%H:%M')}</div>
-                <div>تعداد اقلام: {len(rows)}</div>
-              </td>
-            </tr>
-          </table>
-
-          <table width="100%"  style="border-collapse:collapse;margin-top:12px">
-            <thead>
-              <tr style="background-color:#2C6699; color:#ffffff;">
-                <th style="border:1px solid #9bb0c4; padding:6px;">ردیف</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">کد</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">نام</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">دسته</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">تعداد کل</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">استفاده شده</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">موجودی</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">قیمت واحد</th>
-                <th style="border:1px solid #9bb0c4; padding:6px;">مشخصات</th>
-              </tr>
-            </thead>
+          {InvoiceBuilder._title_band(
+              p, studio_name,
+              "<div style='font-size:10pt;'>لیست انبار تجهیزات</div>",
+              [f"تاریخ چاپ: {now.strftime('%Y/%m/%d')}", f"ساعت: {now.strftime('%H:%M')}",
+               f"تعداد اقلام: {len(rows)}"])}
+          <table width="100%" style="border-collapse:collapse; margin-top:5px;">
+            <thead>{InvoiceBuilder._head(['ردیف', 'کد', 'نام', 'دسته', 'تعداد کل', 'استفاده شده',
+                                          'موجودی', 'قیمت واحد', 'مشخصات'],
+                                         bg=p['table_head'], fg=p['table_head_fg'])}</thead>
             <tbody>{body}</tbody>
+            <tfoot>
+              {InvoiceBuilder._row([
+                  InvoiceBuilder._td('<b>جمع کل</b>', align='right', colspan=4,
+                                     bg=p['total_bg'], size='8pt', bold=True),
+                  InvoiceBuilder._td(f"<b>{total_count}</b>", bg=p['total_bg'], size='8pt', bold=True),
+                  InvoiceBuilder._td(f"<b>{total_used}</b>", bg=p['total_bg'], size='8pt', bold=True),
+                  InvoiceBuilder._td(f"<b>{total_remain}</b>", bg=p['total_bg'], size='8pt', bold=True),
+                  InvoiceBuilder._td("", bg=p['total_bg'], size='8pt'),
+                  InvoiceBuilder._td("", bg=p['total_bg'], size='8pt'),
+              ])}
+            </tfoot>
           </table>
-
-          <div style="margin-top:10px; font-size:10pt;">
-            <b>ارزش ریالی موجودی انبار:</b> {total_value:,} تومان &nbsp;|&nbsp;
+          <div style="margin-top:5px; font-size:8.5pt;">
+            <b>ارزش ریالی موجودی انبار:</b> {total_value:,} تومان |
             <b>به حروف:</b> {number_to_persian_words(total_value)} تومان
           </div>
-          <div style="text-align:center; margin-top:34px; font-size:10pt;">مهر و امضای انباردار / مدیر</div>
-          <div style="text-align:center; margin-top:18px; font-size:8pt; color:#7f8c8d; border-top:1px solid #cfdbe8; padding-top:8px;">
-            {studio_name} &nbsp;|&nbsp; تلفن: {studio_phone}
+          <div style="text-align:center; margin-top:24px; font-size:9pt;">مهر و امضای انباردار / مدیر</div>
+          <div style="text-align:center; margin-top:8px; font-size:7pt; color:{p['muted']};">
+            {studio_name} | تلفن: {studio_phone}
           </div>
         </div>
         """
 
     def print_inventory(self):
-        self._output_flow(lambda with_details: self.inventory_html(),
+        self._output_flow(lambda wd, ws, mono: self.inventory_html(mono),
                           "لیست_انبار.pdf", "لیست انبار تجهیزات", allow_details=False)
 
     # ============================================================
@@ -7341,8 +8553,8 @@ class StudioAccountingApp(QMainWindow):
         self.b_table.setHorizontalHeaderLabels(["نام بانک", "شماره کارت", "شماره شبا", "حذف"])
         self.b_table.setAlternatingRowColors(True)
         self.b_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.b_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.b_table.verticalHeader().setDefaultSectionSize(34)
+        persist_table(self.b_table, "banks", QHeaderView.ResizeMode.Stretch)
+        self.b_table.verticalHeader().setDefaultSectionSize(32)
         tl.addWidget(self.b_table)
         table_box.setLayout(tl)
         layout.addWidget(table_box, 4)
@@ -7486,8 +8698,8 @@ class StudioAccountingApp(QMainWindow):
         ])
         self.chk_table.setAlternatingRowColors(True)
         self.chk_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.chk_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
-        self.chk_table.verticalHeader().setDefaultSectionSize(38)
+        persist_table(self.chk_table, "checks", QHeaderView.ResizeMode.ResizeToContents)
+        self.chk_table.verticalHeader().setDefaultSectionSize(36)
         tl.addWidget(self.chk_table)
         table_box.setLayout(tl)
         layout.addWidget(table_box, 5)
@@ -7655,9 +8867,9 @@ class StudioAccountingApp(QMainWindow):
             self.chk_table.setCellWidget(r_idx, 10, btn_del)
 
         self.lbl_checks_summary.setText(
-            f"<b>تعداد چک‌ها:</b> {len(rows)} &nbsp;|&nbsp; "
-            f"<b>پاس‌شده:</b> {passed} &nbsp;|&nbsp; "
-            f"<b>جمع چک‌های دریافتی:</b> <span style='color:#1e8449;'>{sum_recv:,}</span> تومان &nbsp;|&nbsp; "
+            f"<b>تعداد چک‌ها:</b> {len(rows)}  |  "
+            f"<b>پاس‌شده:</b> {passed}  |  "
+            f"<b>جمع چک‌های دریافتی:</b> <span style='color:#1e8449;'>{sum_recv:,}</span> تومان  |  "
             f"<b>جمع چک‌های پرداختی:</b> <span style='color:#c0392b;'>{sum_paid:,}</span> تومان"
         )
 
@@ -7669,7 +8881,8 @@ class StudioAccountingApp(QMainWindow):
         conn.close()
         self.load_checks_table()
 
-    def check_html(self, cid):
+    def check_html(self, cid, mono=False):
+        p = doc_palette(mono)
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("""SELECT check_number, bank_name, amount, due_date,
@@ -7683,57 +8896,44 @@ class StudioAccountingApp(QMainWindow):
         studio_name, studio_phone, studio_address = InvoiceBuilder._studio_info()
         now = jdatetime.datetime.now()
         ctype = r[6] or "دریافتی"
-        status = "پاس شده ✅" if r[4] else "پاس نشده ⏳"
+        status = "پاس شده" if r[4] else "پاس نشده"
         party_label = "در وجه (پرداختی به)" if ctype == "پرداختی" else "دریافتی از"
-        party_value = r[5] or "-"
+
+        def pair(label, value):
+            return InvoiceBuilder._row([
+                InvoiceBuilder._td(f"<b>{label}</b>", align="right",
+                                   bg=p["box_bg"], size="9pt", width="28%"),
+                InvoiceBuilder._td(value, align="right", size="9pt"),
+            ])
+
+        rows = (pair("شماره چک:", r[0]) +
+                pair("بانک:", r[1] or "-") +
+                pair(party_label + ":", r[5] or "-") +
+                pair("نوع چک:", ctype) +
+                pair("مبلغ:", f"<b>{r[2]:,}</b> تومان") +
+                pair("مبلغ به حروف:", f"{number_to_persian_words(r[2])} تومان") +
+                pair("تاریخ سررسید:", r[3] or "-") +
+                pair("وضعیت:", status) +
+                pair("توضیحات:", r[7] or "-"))
 
         return f"""
-        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:11pt;">
-          <table width="100%"  style="border-collapse:collapse;background-color:{'#1e8449' if ctype == 'دریافتی' else '#a93226'}">
-            <tr>
-              <td style="padding:14px; text-align:center; color:#ffffff;">
-                <div style="font-size:21pt; font-weight:bold;">{studio_name}</div>
-                <div style="font-size:12pt;">رسید چک {ctype}</div>
-              </td>
-              <td width="26%"  style="padding:14px;color:#ffffff;font-size:9pt;text-align:left">
-                <div>تاریخ چاپ: {now.strftime('%Y/%m/%d')}</div>
-                <div>ساعت: {now.strftime('%H:%M')}</div>
-                <div>وضعیت: {status}</div>
-              </td>
-            </tr>
-          </table>
-
-          <table width="100%"  style="border-collapse:collapse;margin-top:14px">
-            <tr><td width="30%"  style="border:1px solid #9bb0c4;background-color:#f4f8fd;padding:9px"><b>شماره چک:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;">{r[0]}</td></tr>
-            <tr><td style="border:1px solid #9bb0c4; background-color:#f4f8fd; padding:9px;"><b>بانک:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;">{r[1] or '-'}</td></tr>
-            <tr><td style="border:1px solid #9bb0c4; background-color:#f4f8fd; padding:9px;"><b>{party_label}:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;">{party_value}</td></tr>
-            <tr><td style="border:1px solid #9bb0c4; background-color:#f4f8fd; padding:9px;"><b>نوع چک:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;">{ctype}</td></tr>
-            <tr><td style="border:1px solid #9bb0c4; background-color:#f4f8fd; padding:9px;"><b>مبلغ:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;"><b>{r[2]:,}</b> تومان</td></tr>
-            <tr><td style="border:1px solid #9bb0c4; background-color:#f4f8fd; padding:9px;"><b>مبلغ به حروف:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;">{number_to_persian_words(r[2])} تومان</td></tr>
-            <tr><td style="border:1px solid #9bb0c4; background-color:#f4f8fd; padding:9px;"><b>تاریخ سررسید:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;">{r[3] or '-'}</td></tr>
-            <tr><td style="border:1px solid #9bb0c4; background-color:#f4f8fd; padding:9px;"><b>توضیحات:</b></td>
-                <td style="border:1px solid #9bb0c4; padding:9px;">{r[7] or '-'}</td></tr>
-          </table>
-
-          <div style="text-align:center; margin-top:60px; font-size:11pt;">مهر و امضای حسابداری</div>
-          <div style="text-align:center; margin-top:24px; font-size:8pt; color:#7f8c8d; border-top:1px solid #cfdbe8; padding-top:8px;">
-            {studio_name} &nbsp;|&nbsp; تلفن: {studio_phone}
-            {('&nbsp;|&nbsp; ' + studio_address) if studio_address else ''}
+        <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:9pt;">
+          {InvoiceBuilder._title_band(
+              p, studio_name,
+              f"<div style='font-size:10pt;'>رسید چک {ctype}</div>",
+              [f"تاریخ چاپ: {now.strftime('%Y/%m/%d')}", f"ساعت: {now.strftime('%H:%M')}",
+               f"وضعیت: {status}"])}
+          <table width="100%" style="border-collapse:collapse; margin-top:6px;">{rows}</table>
+          <div style="text-align:center; margin-top:36px; font-size:9pt;">مهر و امضای حسابداری</div>
+          <div style="text-align:center; margin-top:10px; font-size:7pt; color:{p['muted']};">
+            {studio_name} | تلفن: {studio_phone}{(' | ' + studio_address) if studio_address else ''}
           </div>
         </div>
         """
 
     def print_check(self, cid):
-        html = self.check_html(cid)
-        if html:
-            print_html_document(html, self, "رسید چک")
+        self._output_flow(lambda wd, ws, mono: self.check_html(cid, mono),
+                          "رسید_چک.pdf", "رسید چک", allow_details=False)
 
     def delete_check(self, cid):
         if not ask_security_password(self):
@@ -7874,17 +9074,17 @@ class StudioAccountingApp(QMainWindow):
             name or "-", amount, self.rc_for.text(), self.rc_date.text(), direction)
         self.rc_preview.setHtml(html)
 
-    def get_receipt_html(self):
+    def get_receipt_html(self, mono=False):
         name = self.rc_name.text().strip()
         amount = parse_number(self.rc_amount.text())
         if not name or amount <= 0:
             return None
         direction = "دریافتی" if self.rc_direction.currentIndex() == 0 else "پرداختی"
         return InvoiceBuilder.build_receipt(
-            name, amount, self.rc_for.text(), self.rc_date.text(), direction)
+            name, amount, self.rc_for.text(), self.rc_date.text(), direction, mono)
 
     def print_receipt(self):
-        html = self.get_receipt_html()
+        html = self.get_receipt_html(mono=True)
         if not html:
             QMessageBox.warning(self, "خطا", "لطفاً نام طرف حساب و مبلغ را وارد کنید.")
             return
@@ -8100,9 +9300,9 @@ class StudioAccountingApp(QMainWindow):
             raw = cursor.fetchone()[0]
             conn.close()
             self.lbl_year_stats.setText(
-                f"<b>سال کاری {wy}:</b> &nbsp; " +
-                " &nbsp;|&nbsp; ".join(f"{k}: {v}" for k, v in stats.items()) +
-                f" &nbsp;|&nbsp; جمع خام قراردادها: {raw:,} تومان"
+                f"<b>سال کاری {wy}:</b>   " +
+                "  |  ".join(f"{k}: {v}" for k, v in stats.items()) +
+                f"  |  جمع خام قراردادها: {raw:,} تومان"
             )
         except Exception as e:
             print("[YEAR] stats error:", e)
@@ -8376,6 +9576,10 @@ class StudioAccountingApp(QMainWindow):
 
     def _run_auto_backup_rotation(self):
         """نگهداری نسخه‌های داخلی و حذف قدیمی‌ترها"""
+        try:
+            save_geometry("main", self)
+        except Exception:
+            pass
         try:
             if not os.path.exists(DB_NAME):
                 return
