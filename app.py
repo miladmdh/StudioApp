@@ -4247,16 +4247,19 @@ class InvoiceBuilder:
     @staticmethod
     def _title_band(p, right_title, right_sub, left_lines):
         """سربرگ رنگی/خاکستری سند"""
-        left = "".join(f"<div>{ln}</div>" for ln in left_lines if ln)
-        return (
-            f"<table width='100%' style='border-collapse:collapse;'>"
-            f"<tr style='background-color:{p['head_bg']};'>"
-            f"{InvoiceBuilder._rev([
-                InvoiceBuilder._td(right_title + right_sub, align='center',
-                                   size='10pt', color=p['head_fg'], bold=True),
-                InvoiceBuilder._td(left, align='left', size='7pt', color=p['head_fg']),
-            ])}"
-            f"</tr></table>")
+        left = "".join("<div>" + str(ln) + "</div>" for ln in left_lines if ln)
+        head_bg = p["head_bg"]
+        head_fg = p["head_fg"]
+        # توجه: محاسبه سلول‌ها بیرون از f-string انجام می‌شود، چون در
+        # پایتون ۳٫۱۰ و ۳٫۱۱ بیان داخل {} نمی‌تواند چندخطی باشد.
+        cells = InvoiceBuilder._rev([
+            InvoiceBuilder._td(right_title + right_sub, align="center",
+                               size="10pt", color=head_fg, bold=True),
+            InvoiceBuilder._td(left, align="left", size="7pt", color=head_fg),
+        ])
+        return ("<table width='100%' style='border-collapse:collapse;'>"
+                "<tr style='background-color:" + head_bg + ";'>"
+                + cells + "</tr></table>")
 
     # ============================================================
     # ================  فاکتور عروس و داماد  =====================
