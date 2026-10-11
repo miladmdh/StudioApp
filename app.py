@@ -50,7 +50,7 @@ from matplotlib.figure import Figure
 # تنظیم ID جهت آیکون ویندوز
 try:
     import ctypes
-    myappid = 'imartstudio.accounting.v11.0'
+    myappid = 'imartstudio.accounting.v12.0'
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 except Exception:
     pass
@@ -73,7 +73,7 @@ def get_app_dir():
 
 APP_DIR = get_app_dir()
 DB_NAME = os.path.join(APP_DIR, "studio_accounting.db")
-APP_VERSION = "11.0"
+APP_VERSION = "12.0"
 DEVELOPER_NAME = "میلاد محمدحسینی"
 
 # ⚠️ مقدار پیش‌فرض فونت (بعد از ساخت QApplication نهایی می‌شود)
@@ -1382,6 +1382,71 @@ def persist_splitter(splitter, key):
 
 
 # ---------------------------------------------------------------
+# ۶-۷) ابزارهای نسخه ۱۲
+# ---------------------------------------------------------------
+def screen_available(dialog=None):
+    try:
+        scr = (dialog.screen() if dialog is not None else None) or QApplication.primaryScreen()
+        return scr.availableGeometry() if scr else None
+    except Exception:
+        return None
+
+
+def fit_dialog_to_screen(dialog, width, height, min_w=420, min_h=300):
+    """اندازه دیالوگ را متناسب با صفحه‌نمایش تنظیم و آن را وسط‌چین می‌کند"""
+    try:
+        geo = screen_available(dialog)
+        if geo:
+            w = min(int(width), max(min_w, geo.width() - 60))
+            h = min(int(height), max(min_h, geo.height() - 100))
+            dialog.resize(w, h)
+            dialog.move(geo.x() + (geo.width() - w) // 2,
+                        geo.y() + (geo.height() - h) // 2)
+        else:
+            dialog.resize(width, height)
+    except Exception as e:
+        print("[DIALOG] fit error:", e)
+
+
+def make_scrollable(inner_layout_owner, min_height=120):
+    """یک ویجت را داخل ناحیه اسکرول‌دار قرار می‌دهد تا در صفحه‌های کوچک هم کامل دیده شود"""
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    area.setMinimumHeight(min_height)
+    area.setWidget(inner_layout_owner)
+    return area
+
+
+def equipment_profit_rows():
+    """
+    سود تجهیزات: برای هر دوربین، «نصف قیمت ثبت‌شده در انبار» به‌عنوان سود آن دوربین
+    در نظر گرفته می‌شود. سود کسب‌شده = سود هر دوربین × تعداد استفاده در قراردادها.
+    """
+    rows = []
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cur = conn.cursor()
+        cur.execute("""SELECT ip.item_name, ip.code, COALESCE(ip.price,0),
+                              COALESCE(i.used_count,0), COALESCE(i.category,'')
+                       FROM item_prices ip
+                       LEFT JOIN inventory i ON i.item_name = ip.item_name
+                       WHERE COALESCE(ip.is_camera,0)=1
+                       ORDER BY ip.item_name""")
+        for name, code, price, used, cat in cur.fetchall():
+            each = int(price or 0) // 2
+            used = int(used or 0)
+            rows.append({
+                "name": name, "code": code or "-", "price": int(price or 0),
+                "each": each, "used": used, "total": each * used,
+                "category": cat or "",
+            })
+        conn.close()
+    except Exception as e:
+        print("[PROFIT] error:", e)
+    return rows
+
+# ---------------------------------------------------------------
 # ۶-۶) ویجت‌های کمکی نسخه ۱۱
 # ---------------------------------------------------------------
 class ElidedCheckBox(QCheckBox):
@@ -2039,6 +2104,8 @@ def init_db():
     _add_column_if_missing(cursor, "inventory", "category", "TEXT DEFAULT ''")
     _add_column_if_missing(cursor, "wedding_contracts", "venue", "TEXT")
     _add_column_if_missing(cursor, "inventory", "note", "TEXT DEFAULT ''")
+    _add_column_if_missing(cursor, "item_prices", "is_camera", "INTEGER DEFAULT 0")
+    _add_column_if_missing(cursor, "wedding_contracts", "packages_detail", "TEXT")
 
     # ۰) پر کردن جزئیات قیمت هر قرارداد تا فاکتور دقیقاً همان مبالغ را نشان دهد
     if not _flag_is_set(cursor, "migration_v10_items_detail"):
@@ -2078,6 +2145,31 @@ def init_db():
             print("[DB] Migration: wedding_contracts.total_amount converted to raw (before discount)")
         except Exception as e:
             print("[DB] raw total migration failed:", e)
+
+    # ۲-۲) ذخیره ریز زیرمجموعه پکیج‌ها در هر قرارداد (نسخه ۱۲)
+    #      تا تغییر قیمت انبار روی قراردادهای ثبت‌شده اثر نگذارد.
+    if not _flag_is_set(cursor, "migration_v12_packages_detail"):
+        try:
+            cursor.execute("SELECT id, selected_items FROM wedding_contracts")
+            for cid, items in cursor.fetchall():
+                pd = {}
+                for it in str(items or "").split(','):
+                    it = it.strip()
+                    if not it:
+                        continue
+                    cursor.execute("SELECT is_package FROM item_prices WHERE item_name=?", (it,))
+                    r = cursor.fetchone()
+                    if r and r[0] == 1:
+                        cursor.execute("SELECT item_name, code, price FROM item_prices "
+                                       "WHERE parent_package=? ORDER BY item_name", (it,))
+                        pd[it] = [{"name": x[0], "code": x[1] or "", "price": x[2] or 0}
+                                  for x in cursor.fetchall()]
+                cursor.execute("UPDATE wedding_contracts SET packages_detail=? WHERE id=?",
+                               (json.dumps(pd, ensure_ascii=False), cid))
+            _set_flag(cursor, "migration_v12_packages_detail")
+            print("[DB] Migration: packages_detail filled")
+        except Exception as e:
+            print("[DB] packages_detail migration failed:", e)
 
     # ۳) ردیف بیعانه‌ها و پرداخت‌ها همیشه درست شماره‌گذاری شود (فقط نمایشی است)
 
@@ -2197,12 +2289,12 @@ class PrintChoiceDialog(QDialog):
 # ============================================================
 class PackageDetailsDialog(QDialog):
     """
-    مدیریت کامل یک پکیج و زیرمجموعه‌هایش:
-      • افزودن آیتم جدید با قیمت
-      • افزودن از کالاها/خدمات موجود
-      • حذف آیتم از پکیج یا حذف کامل کالا
-      • تغییر نام و قیمت خود پکیج و همه آیتم‌ها
-      • جمع قیمت زیرمجموعه‌ها به‌صورت خودکار قیمت کلی پکیج می‌شود
+    مدیریت کامل یک پکیج و زیرمجموعه‌هایش (نسخه ۱۲):
+      • افزودن آیتم از کالاها و خدمات انبار
+      • افزودن آیتم جدید، حذف یا خارج کردن آیتم
+      • تغییر نام و قیمت پکیج و همه آیتم‌ها
+      • دکمه «تکمیل پکیج»: جمع همه آیتم‌ها می‌شود قیمت کلی پکیج
+    پکیج بدون آیتم قابل تکمیل و قابل اضافه شدن به قرارداد نیست.
     """
 
     def __init__(self, item_name, parent=None):
@@ -2210,11 +2302,13 @@ class PackageDetailsDialog(QDialog):
         self.old_name = item_name
         self.pkg_name = item_name
         self.setWindowTitle(f"مدیریت پکیج: {item_name}")
-        self.resize(820, 700)
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
+        self.setMinimumSize(460, 340)
+        fit_dialog_to_screen(self, 880, 700)
         persist_dialog(self, "dlg_package")
         self._delete_list = []
+        self._saved_total = None
 
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -2225,20 +2319,21 @@ class PackageDetailsDialog(QDialog):
         self._code = row[0] or ""
         self._price = row[1] or 0
 
-        lay = QVBoxLayout(self)
-        lay.setSpacing(8)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(9, 9, 9, 9)
+        layout.setSpacing(7)
 
         # ---------- مشخصات پکیج ----------
         pkg_box = QGroupBox("مشخصات پکیج")
         pkg_form = QFormLayout()
+        pkg_form.setSpacing(6)
         self.txt_name = QLineEdit(item_name)
         self.txt_code = QLineEdit(self._code)
-        self.chk_auto = QCheckBox("قیمت پکیج = جمع قیمت همه زیرمجموعه‌ها (خودکار)")
+        self.chk_auto = QCheckBox("قیمت پکیج = جمع قیمت همه آیتم‌ها (خودکار)")
         self.chk_auto.setChecked(True)
         self.txt_price = QLineEdit(f"{self._price:,}")
         self.txt_price.textChanged.connect(lambda t: self.txt_price.setText(format_number(t)))
         self.txt_price.setEnabled(False)
-
         self.chk_auto.toggled.connect(lambda on: self.txt_price.setEnabled(not on))
         self.chk_auto.toggled.connect(lambda _: self.refresh_total())
 
@@ -2247,12 +2342,15 @@ class PackageDetailsDialog(QDialog):
         pkg_form.addRow("", self.chk_auto)
         pkg_form.addRow(f"{ico('money')} قیمت پکیج (تومان):", self.txt_price)
         pkg_box.setLayout(pkg_form)
-        lay.addWidget(pkg_box)
+        layout.addWidget(pkg_box)
 
-        # ---------- جدول زیرمجموعه‌ها ----------
+        # ---------- جدول آیتم‌ها ----------
+        lbl = QLabel(f"{ico('list')} <b>آیتم‌های این پکیج</b> (قیمت را می‌توانید مستقیم در جدول تغییر دهید)")
+        layout.addWidget(lbl)
+
         self.table = QTableWidget()
         self.table.setColumnCount(4)
-        self.table.setHorizontalHeaderLabels(["ردیف", "کد", "نام آیتم / خدمت", "قیمت (تومان)"])
+        self.table.setHorizontalHeaderLabels(["ردیف", "کد", "نام کالا / خدمات", "قیمت (تومان)"])
         self.table.setAlternatingRowColors(True)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -2260,19 +2358,21 @@ class PackageDetailsDialog(QDialog):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked |
                                    QAbstractItemView.EditTrigger.EditKeyPressed |
                                    QAbstractItemView.EditTrigger.AnyKeyPressed)
+        self.table.setMinimumHeight(110)
         self.table.itemChanged.connect(lambda _i: self.refresh_total())
         persist_table(self.table, "pkg_subs")
-        lay.addWidget(self.table, 1)
+        layout.addWidget(self.table, 1)
 
         # ---------- دکمه‌های عملیات ----------
         row1 = QHBoxLayout()
-        btn_add_new = QPushButton(ico_text("add", "افزودن آیتم جدید"))
+        btn_add_existing = QPushButton(ico_text("add", "افزودن آیتم از انبار"))
+        btn_add_existing.setStyleSheet("background-color:#2980b9; color:white; font-weight:bold; padding:8px;")
+        btn_add_existing.setToolTip("از کالاها و خدمات ثبت‌شده در انبار به این پکیج اضافه کنید")
+        btn_add_existing.clicked.connect(self.add_existing_item)
+
+        btn_add_new = QPushButton(ico_text("add", "آیتم جدید"))
         btn_add_new.setStyleSheet("background-color:#27ae60; color:white; font-weight:bold; padding:8px;")
         btn_add_new.clicked.connect(self.add_new_row)
-
-        btn_add_existing = QPushButton(ico_text("link", "افزودن از کالاهای موجود"))
-        btn_add_existing.setStyleSheet("background-color:#2980b9; color:white; font-weight:bold; padding:8px;")
-        btn_add_existing.clicked.connect(self.add_existing_item)
 
         btn_detach = QPushButton(ico_text("cancel", "خارج کردن از پکیج"))
         btn_detach.setStyleSheet("background-color:#e67e22; color:white; font-weight:bold; padding:8px;")
@@ -2284,28 +2384,38 @@ class PackageDetailsDialog(QDialog):
         btn_del.setToolTip("کالا از کل برنامه حذف می‌شود")
         btn_del.clicked.connect(self.delete_row)
 
-        for b in (btn_add_new, btn_add_existing, btn_detach, btn_del):
+        for b in (btn_add_existing, btn_add_new, btn_detach, btn_del):
             row1.addWidget(b)
-        lay.addLayout(row1)
+        layout.addLayout(row1)
 
         self.lbl_total = QLabel("")
         self.lbl_total.setWordWrap(True)
         self.lbl_total.setStyleSheet("background-color:#fff9e6; border:1px solid #f39c12; "
-                                     "border-radius:8px; padding:10px; font-size:11pt;")
-        lay.addWidget(self.lbl_total)
+                                     "border-radius:8px; padding:9px; font-size:10.5pt;")
+        layout.addWidget(self.lbl_total)
 
+        # ---------- دکمه‌های پایانی (همیشه قابل کلیک) ----------
         row2 = QHBoxLayout()
-        btn_save = QPushButton(ico_text("save", "ذخیره همه تغییرات"))
-        btn_save.setStyleSheet("background-color:#16a085; color:white; font-weight:bold; padding:10px;")
+        btn_finish = QPushButton(ico_text("ok", "تکمیل پکیج (جمع و ثبت قیمت)"))
+        btn_finish.setStyleSheet("background-color:#16a085; color:white; font-weight:bold; padding:10px;")
+        btn_finish.setToolTip("جمع آیتم‌ها به‌عنوان قیمت کلی پکیج ثبت می‌شود و پکیج قابل تیک زدن می‌گردد")
+        btn_finish.clicked.connect(self.finish_package)
+
+        btn_save = QPushButton(ico_text("save", "ذخیره بدون بستن"))
+        btn_save.setStyleSheet("background-color:#2980b9; color:white; font-weight:bold; padding:10px;")
         btn_save.clicked.connect(self.save_all)
-        btn_print = QPushButton(ico_text("print", "چاپ / PDF جزئیات"))
+
+        btn_print = QPushButton(ico_text("print", "چاپ / PDF"))
         btn_print.clicked.connect(self.print_details)
+
         btn_close = QPushButton(ico_text("cancel", "بستن"))
         btn_close.clicked.connect(self.reject)
+
+        row2.addWidget(btn_finish, 3)
         row2.addWidget(btn_save, 2)
         row2.addWidget(btn_print, 2)
         row2.addWidget(btn_close, 1)
-        lay.addLayout(row2)
+        layout.addLayout(row2)
 
         self.load_subs()
 
@@ -2365,11 +2475,13 @@ class PackageDetailsDialog(QDialog):
             price = total
         else:
             price = parse_number(self.txt_price.text())
+        warn = "" if subs else ("<br><b style='color:#c0392b;'>"
+                                "این پکیج هیچ آیتمی ندارد و قابل اضافه شدن به قرارداد نیست.</b>")
         self.lbl_total.setText(
-            f"<b>تعداد زیرمجموعه‌ها:</b> {len(subs)}  |  "
-            f"<b>جمع قیمت زیرمجموعه‌ها:</b> {total:,} تومان<br>"
-            f"<b>قیمت نهایی این پکیج:</b> {price:,} تومان  |  "
-            f"<b>به حروف:</b> {number_to_persian_words(price)} تومان"
+            f"<b>تعداد آیتم‌ها:</b> {len(subs)} | "
+            f"<b>جمع قیمت آیتم‌ها:</b> {total:,} تومان<br>"
+            f"<b>قیمت نهایی این پکیج:</b> {price:,} تومان | "
+            f"<b>به حروف:</b> {number_to_persian_words(price)} تومان{warn}"
         )
 
     # ---------------- عملیات جدول ----------------
@@ -2383,31 +2495,34 @@ class PackageDetailsDialog(QDialog):
         self.refresh_total()
 
     def add_existing_item(self):
+        """افزودن آیتم از کالاها و خدمات ثبت‌شده در انبار"""
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute("SELECT item_name FROM item_prices "
-                       "WHERE (parent_package IS NULL OR parent_package='' OR parent_package<>?) "
-                       "AND item_name<>? ORDER BY item_name", (self.pkg_name, self.pkg_name))
-        names = [r[0] for r in cursor.fetchall()]
+        cursor.execute("""SELECT item_name, price FROM item_prices
+                          WHERE COALESCE(is_package,0)=0 AND item_name<>?
+                          ORDER BY item_name""", (self.pkg_name,))
+        data = cursor.fetchall()
         conn.close()
+        already = {n for n, _, _ in self.current_subs()}
+        names = [n for n, _p in data if n not in already]
+        prices = {n: p for n, p in data}
         if not names:
-            QMessageBox.information(self, "افزودن آیتم",
-                                    "کالای آزاد دیگری برای افزودن وجود ندارد.\n"
-                                    "ابتدا از بخش انبار یا مدیریت کالاها آیتم جدید بسازید.")
+            QMessageBox.information(
+                self, "افزودن آیتم",
+                "همه کالاها و خدمات انبار در این پکیج هستند.\n"
+                "برای ساخت قلم جدید از «مدیریت کالاها / انبار» استفاده کنید.")
             return
-        name, ok = QInputDialog.getItem(self, "افزودن از کالاهای موجود",
+        name, ok = QInputDialog.getItem(self, "افزودن آیتم از انبار",
                                         "کالا / خدمت را انتخاب کنید:", names, 0, False)
         if not ok or not name:
             return
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute("SELECT code, price FROM item_prices WHERE item_name=?", (name,))
+        cursor.execute("SELECT code FROM item_prices WHERE item_name=?", (name,))
         r = cursor.fetchone()
         conn.close()
-        code = r[0] if r else ""
-        price = r[1] if r else 0
         self.table.blockSignals(True)
-        self._insert_row(self.table.rowCount() + 1, code, name, price)
+        self._insert_row(self.table.rowCount() + 1, (r[0] if r else ""), name, prices.get(name, 0))
         self.table.blockSignals(False)
         self.refresh_total()
 
@@ -2433,13 +2548,13 @@ class PackageDetailsDialog(QDialog):
         self.refresh_total()
 
     # ---------------- ذخیره ----------------
-    def save_all(self):
+    def save_all(self, silent=False):
         if not ask_security_password(self):
-            return
+            return False
         new_name = self.txt_name.text().strip()
         if not new_name:
             QMessageBox.warning(self, "خطا", "نام پکیج نمی‌تواند خالی باشد.")
-            return
+            return False
 
         subs = self.current_subs()
         subs_total = sum(p for _, _, p in subs)
@@ -2447,22 +2562,19 @@ class PackageDetailsDialog(QDialog):
         code = self.txt_code.text().strip() or generate_unique_code(
             "PKG", "item_prices", "code", start=2001)
 
-        # یکتا بودن کد
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("SELECT item_name FROM item_prices WHERE code=? AND item_name<>?",
                        (code, self.old_name))
         dup = cursor.fetchone()
-        cursor.execute("SELECT item_name FROM item_prices WHERE parent_package=?",
-                       (self.old_name,))
+        cursor.execute("SELECT item_name FROM item_prices WHERE parent_package=?", (self.old_name,))
         old_subs = {r[0] for r in cursor.fetchall()}
         conn.close()
         if dup:
             QMessageBox.warning(self, "کد تکراری",
                                 f"کد «{code}» قبلاً برای «{dup[0]}» ثبت شده است.")
-            return
+            return False
 
-        # نام و قیمت خود پکیج
         if new_name != self.old_name:
             sync_item_everywhere(self.old_name, new_name, code, price, 1, "")
         else:
@@ -2477,18 +2589,15 @@ class PackageDetailsDialog(QDialog):
         self.old_name = new_name
         keep = {n for n, _, _ in subs}
 
-        # زیرمجموعه‌هایی که از جدول حذف شده‌اند، از پکیج خارج می‌شوند
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         for name in old_subs - keep:
             cursor.execute("UPDATE item_prices SET parent_package='' WHERE item_name=?", (name,))
-        # کالاهایی که کاربر «حذف کامل» را زده
         for name in self._delete_list:
             cursor.execute("DELETE FROM item_prices WHERE item_name=?", (name,))
             cursor.execute("DELETE FROM inventory WHERE item_name=?", (name,))
         self._delete_list = []
 
-        # درج یا به‌روزرسانی زیرمجموعه‌ها
         for n, c, p in subs:
             if n == new_name:
                 continue
@@ -2502,7 +2611,6 @@ class PackageDetailsDialog(QDialog):
             cursor.execute("INSERT OR IGNORE INTO inventory (item_name, total_count, used_count) "
                            "VALUES (?, 0, 0)", (n,))
 
-        # قیمت پکیج هم برابر جمع زیرمجموعه‌ها
         cursor.execute("UPDATE item_prices SET price=? WHERE item_name=?", (price, new_name))
         cursor.execute("INSERT OR IGNORE INTO inventory (item_name, total_count, used_count) "
                        "VALUES (?, 0, 0)", (new_name,))
@@ -2512,11 +2620,29 @@ class PackageDetailsDialog(QDialog):
         recalc_inventory_usage()
         self.setWindowTitle(f"مدیریت پکیج: {new_name}")
         self.chk_auto.setChecked(True)
+        self._saved_total = price
         self.load_subs()
-        QMessageBox.information(
-            self, "موفقیت",
-            f"تغییرات پکیج «{new_name}» ذخیره شد.\n"
-            f"قیمت پکیج برابر جمع {len(subs)} زیرمجموعه = {price:,} تومان شد.")
+        if not silent:
+            QMessageBox.information(
+                self, "موفقیت",
+                f"تغییرات پکیج «{new_name}» ذخیره شد.\n"
+                f"قیمت پکیج برابر جمع {len(subs)} آیتم = {price:,} تومان شد.")
+        return True
+
+    def finish_package(self):
+        """جمع آیتم‌ها و ثبت به‌عنوان قیمت کلی پکیج، سپس بستن"""
+        if not self.current_subs():
+            QMessageBox.warning(
+                self, "پکیج خالی",
+                "برای تکمیل پکیج باید حداقل یک آیتم به آن اضافه کنید.\n"
+                "پکیج بدون آیتم قابل اضافه شدن به قرارداد نیست.")
+            return
+        if self.save_all(silent=True):
+            QMessageBox.information(
+                self, "پکیج تکمیل شد",
+                f"قیمت پکیج «{self.pkg_name}» برابر {(self._saved_total or 0):,} تومان ثبت شد.\n"
+                "حالا می‌توانید آن را در قرارداد تیک بزنید.")
+            self.accept()
 
     # ---------------- چاپ و PDF ----------------
     def _html(self, mono=False):
@@ -2536,7 +2662,7 @@ class PackageDetailsDialog(QDialog):
                 InvoiceBuilder._td(f"{pr:,}", size="8pt"),
             ])
         if not rows:
-            rows = f"<tr>{InvoiceBuilder._td('زیرمجموعه‌ای ثبت نشده', colspan=4, size='9pt')}</tr>"
+            rows = f"<tr>{InvoiceBuilder._td('آیتمی ثبت نشده', colspan=4, size='9pt')}</tr>"
 
         return f"""
         <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:9pt;">
@@ -2553,12 +2679,12 @@ class PackageDetailsDialog(QDialog):
             ])}
           </table>
           <table width="100%" style="border-collapse:collapse; margin-top:5px;">
-            <thead>{InvoiceBuilder._head(['ردیف', 'کد', 'عنوان زیرمجموعه', 'قیمت (تومان)'],
+            <thead>{InvoiceBuilder._head(['ردیف', 'کد', 'نام کالا / خدمات', 'قیمت (تومان)'],
                                          bg=p['table_head'], fg=p['table_head_fg'])}</thead>
             <tbody>{rows}</tbody>
             <tfoot>
               {InvoiceBuilder._row([
-                  InvoiceBuilder._td("<b>جمع قیمت زیرمجموعه‌ها</b>", align="right",
+                  InvoiceBuilder._td("<b>جمع قیمت آیتم‌ها</b>", align="right",
                                      colspan=3, bg=p['alt_row'], size="9pt", bold=True),
                   InvoiceBuilder._td(f"<b>{total:,}</b>", bg=p['alt_row'], size="9pt", bold=True),
               ])}
@@ -2602,25 +2728,29 @@ class PackageDetailsDialog(QDialog):
 # ================  ChartDialog (نمایش نمودار)  ==============
 # ============================================================
 class ChartDialog(QDialog):
-    """نمایش نمودار با عنوان فارسی درست و امکان چاپ سیاه‌وسفید / ذخیره رنگی"""
+    """نمایش نمودار با عنوان فارسی درست و خروجی PDF/چاپ رنگی و سیاه‌وسفید"""
 
     def __init__(self, figure, title, parent=None):
         super().__init__(parent)
         self.figure = figure
         self.chart_title = title
         self.setWindowTitle(title)
-        self.resize(980, 660)
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
+        self.setMinimumSize(520, 360)
+        fit_dialog_to_screen(self, 980, 660)
         persist_dialog(self, "dlg_chart")
 
         lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
         head = QLabel(f"{ico('chart')}  {title}")
         head.setProperty("heading", True)
         head.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(head)
 
         self.canvas = FigureCanvas(figure)
+        self.canvas.setMinimumHeight(180)
         lay.addWidget(self.canvas, 1)
 
         row = QHBoxLayout()
@@ -2665,16 +2795,25 @@ class ChartDialog(QDialog):
             QMessageBox.critical(self, "خطا", str(e))
 
     def save_pdf(self):
+        """
+        خروجی PDF نمودار با موتور متن/تصویر خود Qt ساخته می‌شود.
+        (پیش‌تر از backend_pdf خود matplotlib استفاده می‌شد که در نسخه
+        اجرایی با خطای «No module named matplotlib.backends.backend_pdf»
+        مواجه می‌شد.)
+        """
         path, _ = QFileDialog.getSaveFileName(self, "ذخیره PDF نمودار",
                                               f"{self._safe_name()}.pdf", "PDF (*.pdf)")
         if not path:
             return
         try:
-            self.figure.savefig(path, format="pdf", bbox_inches="tight",
-                                facecolor=self.figure.get_facecolor())
-            QMessageBox.information(self, "موفقیت", "PDF نمودار ذخیره شد.")
+            html = self._html_with_image(gray=False)
+            ok, err = save_html_pdf(html, path, self.chart_title)
+            if ok:
+                QMessageBox.information(self, "موفقیت", f"فایل PDF نمودار ذخیره شد:\n{path}")
+            else:
+                QMessageBox.critical(self, "خطا", f"ساخت PDF ناموفق بود:\n{err}")
         except Exception as e:
-            QMessageBox.critical(self, "خطا", str(e))
+            QMessageBox.critical(self, "خطا", f"ساخت PDF ناموفق بود:\n{e}")
 
     def save_excel(self):
         path, _ = QFileDialog.getSaveFileName(self, "خروجی اکسل نمودار",
@@ -2684,14 +2823,31 @@ class ChartDialog(QDialog):
         headers = ["عنوان", "مقدار"]
         rows = []
         for ax in self.figure.axes:
-            for patch, label in zip(ax.patches, ax.get_xticklabels()):
+            # نمودار میله‌ای
+            for patch in ax.patches:
                 try:
-                    rows.append([label.get_text(), int(patch.get_height())])
+                    val = patch.get_height()
+                    if val == 0:
+                        val = patch.get_width()
+                    rows.append([f"ستون {len(rows) + 1}", int(val)])
                 except Exception:
-                    pass
+                    continue
+            # نمودار خطی / نقطه‌ای
+            for line in ax.lines:
+                try:
+                    for x, y in zip(line.get_xdata(), line.get_ydata()):
+                        if isinstance(y, (int, float)):
+                            rows.append([str(x), int(y)])
+                except Exception:
+                    continue
+            # نمودار دایره‌ای
+            for wedge in getattr(ax, "patches", []):
+                pass
+        if not rows:
+            rows = [[self.chart_title, 0]]
         ok, err = export_rows_to_excel(headers, rows, path, "نمودار", self.chart_title)
         if ok:
-            QMessageBox.information(self, "موفقیت", "خروجی اکسل ذخیره شد.")
+            QMessageBox.information(self, "موفقیت", f"خروجی اکسل ذخیره شد:\n{path}")
         else:
             QMessageBox.critical(self, "خطا", err)
 
@@ -2729,6 +2885,8 @@ class ChartDialog(QDialog):
     def print_chart(self):
         # پرینت سیاه و سفید می‌شود تا روی چاپگر لیزری تمیز باشد
         print_html_document(self._html_with_image(gray=True), self, self.chart_title)
+
+
 # ============================================================
 # ======  SettlementStatusDialog (وضعیت تسویه پروژه‌ها)  ======
 # ============================================================
@@ -3025,23 +3183,33 @@ class LoadingScreen(QWidget):
 class ManageItemsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("مدیریت پکیج‌ها، زیرمجموعه‌ها، کالاها و انبار")
-        self.resize(880, 720)
-        persist_dialog(self, "dlg_manage_items")
+        self.setWindowTitle("مدیریت کالاها، خدمات، پکیج‌ها و انبار")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
+        # حداقل اندازه کوچک تا در صفحه‌های کوچک هم دکمه‌ها بیرون نزنند
+        self.setMinimumSize(440, 330)
+        fit_dialog_to_screen(self, 900, 700)
+        persist_dialog(self, "dlg_manage_items")
 
-        layout = QVBoxLayout()
-        form_layout = QFormLayout()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(9, 9, 9, 9)
+        layout.setSpacing(7)
+
+        # ---------- فرم ورود اطلاعات (داخل ناحیه اسکرول) ----------
+        form_widget = QWidget()
+        form_layout = QFormLayout(form_widget)
+        form_layout.setSpacing(6)
+        form_layout.setContentsMargins(0, 0, 0, 0)
 
         self.txt_item_code = QLineEdit()
         self.txt_item_code.setPlaceholderText("خالی بگذارید تا کد یکتا خودکار ساخته شود")
         self.txt_item_name = QLineEdit()
         self.txt_item_price = QLineEdit()
         self.txt_item_price.textChanged.connect(lambda t: self.txt_item_price.setText(format_number(t)))
+        self.txt_item_price.textChanged.connect(self.update_profit_hint)
 
         self.txt_item_category = QLineEdit()
-        self.txt_item_category.setPlaceholderText("مثلاً: دوربین، لنز، نور، خدمات")
+        self.txt_item_category.setPlaceholderText("دوربین، لنز، نور، خدمات...")
         self.spin_total_count = QSpinBox()
         self.spin_total_count.setRange(0, 100000)
         self.spin_total_count.setValue(10)
@@ -3051,59 +3219,79 @@ class ManageItemsDialog(QDialog):
 
         self.chk_is_package = QCheckBox("این مورد یک پکیج اصلی است")
         self.chk_is_package.stateChanged.connect(self.toggle_package_mode)
+        self.chk_is_camera = QCheckBox("این مورد دوربین است (سود = نصف قیمت)")
+        self.chk_is_camera.stateChanged.connect(self.update_profit_hint)
 
         self.combo_parent_package = QComboBox()
         self.load_packages_combo()
 
         form_layout.addRow(f"{ico('add')} کد کالا / خدمات:", self.txt_item_code)
-        form_layout.addRow(f"{ico('list')} نام مورد / پکیج:", self.txt_item_name)
+        form_layout.addRow(f"{ico('list')} نام کالا یا خدمات:", self.txt_item_name)
         form_layout.addRow(f"{ico('money')} قیمت (تومان):", self.txt_item_price)
-        form_layout.addRow(f"{ico('inventory')} دسته‌بندی انبار:", self.txt_item_category)
+        form_layout.addRow(f"{ico('inventory')} دسته‌بندی:", self.txt_item_category)
         form_layout.addRow(f"{ico('inventory')} تعداد کل در انبار:", self.spin_total_count)
         form_layout.addRow(f"{ico('detail')} مشخصات / توضیحات:", self.txt_item_note)
+        form_layout.addRow("", self.chk_is_camera)
         form_layout.addRow("", self.chk_is_package)
         form_layout.addRow(f"{ico('package')} پکیج مادر (برای زیرمجموعه):", self.combo_parent_package)
 
+        self.lbl_profit = QLabel("")
+        self.lbl_profit.setWordWrap(True)
+        self.lbl_profit.setStyleSheet("background-color:#eafaf1; border:1px solid #27ae60; "
+                                      "border-radius:7px; padding:6px; font-size:9pt;")
+        form_layout.addRow(self.lbl_profit)
+
         btn_row = QHBoxLayout()
         btn_add = QPushButton(ico_text("save", "افزودن / بروزرسانی"))
-        btn_add.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 8px;")
+        btn_add.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 7px;")
         btn_add.clicked.connect(self.add_or_update_item)
 
-        btn_auto_code = QPushButton(ico_text("refresh", "تولید کد یکتای خودکار"))
-        btn_auto_code.setStyleSheet("background-color: #2980b9; color: white; font-weight: bold; padding: 8px;")
+        btn_auto_code = QPushButton(ico_text("refresh", "کد یکتای خودکار"))
+        btn_auto_code.setStyleSheet("background-color: #2980b9; color: white; font-weight: bold; padding: 7px;")
         btn_auto_code.clicked.connect(self.generate_auto_code)
 
         btn_row.addWidget(btn_add, 2)
         btn_row.addWidget(btn_auto_code, 1)
         form_layout.addRow(btn_row)
-        layout.addLayout(form_layout)
+
+        form_scroll = QScrollArea()
+        form_scroll.setWidgetResizable(True)
+        form_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        form_scroll.setMinimumHeight(140)
+        form_scroll.setWidget(form_widget)
+        layout.addWidget(form_scroll, 3)
 
         lbl_hint = QLabel(
-            f"{ico('detail')} برای دیدن <b>جزئیات کامل یک پکیج</b> روی آن دوبار کلیک کنید."
-        )
+            f"{ico('detail')} برای دیدن <b>جزئیات کامل یک پکیج</b> روی آن دوبار کلیک کنید. "
+            f"قیمت و نام هر کالا فقط از همین بخش تغییر می‌کند.")
         lbl_hint.setStyleSheet("background-color:#eaf6ff; border:1px solid #a9d3ee; "
-                               "border-radius:8px; padding:8px;")
+                               "border-radius:7px; padding:6px; font-size:9pt;")
+        lbl_hint.setWordWrap(True)
         layout.addWidget(lbl_hint)
 
+        # ---------- جدول ----------
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["کد", "نام آیتم / زیرمجموعه", "قیمت (تومان)", "موجودی انبار", "نوع"])
-        self.tree.setColumnWidth(0, 110)
-        self.tree.setColumnWidth(2, 130)
+        self.tree.setHeaderLabels(["کد", "نام کالا / خدمات", "قیمت (تومان)", "سود دوربین", "موجودی انبار", "نوع"])
+        self.tree.setColumnWidth(0, 100)
+        self.tree.setColumnWidth(2, 120)
         self.tree.setColumnWidth(3, 100)
+        self.tree.setColumnWidth(4, 95)
         self.tree.setAlternatingRowColors(True)
+        self.tree.setMinimumHeight(90)
         self.tree.itemDoubleClicked.connect(self.on_tree_double_click)
-        layout.addWidget(self.tree)
+        layout.addWidget(self.tree, 4)
 
+        # ---------- دکمه‌های پایین (همیشه قابل کلیک) ----------
         bottom_row = QHBoxLayout()
-        btn_details = QPushButton(ico_text("detail", "جزئیات پکیج انتخاب‌شده"))
+        btn_details = QPushButton(ico_text("detail", "جزئیات / ویرایش پکیج"))
         btn_details.setStyleSheet("background-color: #16a085; color: white; font-weight: bold; padding: 8px;")
         btn_details.clicked.connect(self.show_package_details)
 
-        btn_edit = QPushButton(ico_text("edit", "ویرایش (کد / نام / قیمت / تعداد)"))
+        btn_edit = QPushButton(ico_text("edit", "ویرایش کالا / خدمات"))
         btn_edit.setStyleSheet("background-color: #f39c12; color: white; font-weight: bold; padding: 8px;")
         btn_edit.clicked.connect(self.edit_selected_item)
 
-        btn_delete = QPushButton(ico_text("delete", "حذف مورد انتخاب‌شده"))
+        btn_delete = QPushButton(ico_text("delete", "حذف"))
         btn_delete.setStyleSheet("background-color: #c0392b; color: white; font-weight: bold; padding: 8px;")
         btn_delete.clicked.connect(self.delete_item)
 
@@ -3113,7 +3301,20 @@ class ManageItemsDialog(QDialog):
         layout.addLayout(bottom_row)
 
         self.load_tree_items()
-        self.setLayout(layout)
+
+    def update_profit_hint(self, *args):
+        """پیش‌نمایش سود دوربین: نصف قیمت ثبت‌شده"""
+        if not hasattr(self, "lbl_profit"):
+            return
+        price = parse_number(self.txt_item_price.text())
+        if self.chk_is_camera.isChecked():
+            self.lbl_profit.setText(
+                f"{ico('money')} <b>سود این دوربین (نصف قیمت):</b> {price // 2:,} تومان "
+                f"&nbsp;— از قیمت {price:,} تومان")
+        else:
+            self.lbl_profit.setText(
+                f"{ico('detail')} اگر این مورد دوربین است، تیک «این مورد دوربین است» را بزنید "
+                f"تا سود آن (نصف قیمت) محاسبه شود.")
 
     def generate_auto_code(self):
         """تولید کد یکتا — هرگز با کد هیچ کالا/خدمت دیگری یکسان نمی‌شود"""
@@ -3142,7 +3343,8 @@ class ManageItemsDialog(QDialog):
         self.tree.clear()
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute("SELECT item_name, code, price, is_package, parent_package FROM item_prices")
+        cursor.execute("SELECT item_name, code, price, is_package, parent_package, "
+                       "COALESCE(is_camera,0) FROM item_prices")
         rows = cursor.fetchall()
         cursor.execute("SELECT item_name, total_count, used_count FROM inventory")
         inv = {r[0]: (r[1], r[2]) for r in cursor.fetchall()}
@@ -3156,9 +3358,12 @@ class ManageItemsDialog(QDialog):
             remain = max(0, total - used)
             return f"{remain} از {total}"
 
+        def profit_text(row):
+            return f"{int(row[2] or 0) // 2:,}" if row[5] else "-"
+
         for pkg in packages:
             pkg_item = QTreeWidgetItem(self.tree, [
-                pkg[1] or "-", pkg[0], f"{pkg[2]:,}", stock_text(pkg[0]), "پکیج اصلی"
+                pkg[1] or "-", pkg[0], f"{pkg[2]:,}", "-", stock_text(pkg[0]), "پکیج اصلی"
             ])
             pkg_item.setFont(1, QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
             pkg_item.setForeground(1, QColor("#c0392b"))
@@ -3167,14 +3372,16 @@ class ManageItemsDialog(QDialog):
             sub_items = [s for s in singles if s[4] == pkg[0]]
             for sub in sub_items:
                 child = QTreeWidgetItem(pkg_item, [
-                    sub[1] or "-", f"  └ {sub[0]}", f"{sub[2]:,}", stock_text(sub[0]), "زیرمجموعه"
+                    sub[1] or "-", f"  • {sub[0]}", f"{sub[2]:,}", profit_text(sub),
+                    stock_text(sub[0]), "زیرمجموعه"
                 ])
                 child.setData(0, Qt.ItemDataRole.UserRole, sub[0])
 
         independent = [s for s in singles if not s[4]]
         for ind in independent:
             node = QTreeWidgetItem(self.tree, [
-                ind[1] or "-", ind[0], f"{ind[2]:,}", stock_text(ind[0]), "مستقل"
+                ind[1] or "-", ind[0], f"{ind[2]:,}", profit_text(ind),
+                stock_text(ind[0]), "مستقل"
             ])
             node.setData(0, Qt.ItemDataRole.UserRole, ind[0])
 
@@ -3222,6 +3429,7 @@ class ManageItemsDialog(QDialog):
         category = self.txt_item_category.text().strip()
         total_count = self.spin_total_count.value()
         note = self.txt_item_note.text().strip()
+        is_camera = 1 if self.chk_is_camera.isChecked() else 0
 
         if not name:
             QMessageBox.warning(self, "خطا", "لطفاً نام را وارد کنید.")
@@ -3251,12 +3459,13 @@ class ManageItemsDialog(QDialog):
                 return
 
         cursor.execute('''
-            INSERT INTO item_prices (item_name, code, price, is_package, parent_package)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO item_prices (item_name, code, price, is_package, parent_package, is_camera)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_name) DO UPDATE SET
                 code=excluded.code, price=excluded.price,
-                is_package=excluded.is_package, parent_package=excluded.parent_package
-        ''', (name, code, price, is_pkg, parent))
+                is_package=excluded.is_package, parent_package=excluded.parent_package,
+                is_camera=excluded.is_camera
+        ''', (name, code, price, is_pkg, parent, is_camera))
 
         # ---- هماهنگ‌سازی با انبار (تعداد کل، دسته‌بندی و مشخصات) ----
         cursor.execute('''
@@ -3279,6 +3488,7 @@ class ManageItemsDialog(QDialog):
         self.txt_item_category.clear()
         self.txt_item_note.clear()
         self.chk_is_package.setChecked(False)
+        self.chk_is_camera.setChecked(False)
         self.load_packages_combo()
         self.load_tree_items()
 
@@ -3352,42 +3562,58 @@ class ManageItemsDialog(QDialog):
 # ===============  ItemEditDialog (ویرایش کالا)  =============
 # ============================================================
 class ItemEditDialog(QDialog):
-    """ویرایش کامل یک کالا/خدمت/پکیج همراه با مشخصات انبار"""
+    """ویرایش کامل یک کالا/خدمات/پکیج همراه با مشخصات انبار و سود دوربین"""
 
     def __init__(self, item_name, parent=None):
         super().__init__(parent)
         self.old_name = item_name
         self.setWindowTitle(f"ویرایش: {item_name}")
-        self.resize(560, 480)
-        persist_dialog(self, "dlg_item_edit")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
+        self.setMinimumSize(420, 320)
+        fit_dialog_to_screen(self, 620, 640)
+        persist_dialog(self, "dlg_item_edit")
 
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute("SELECT code, price, is_package, parent_package FROM item_prices WHERE item_name=?",
-                       (item_name,))
-        row = cursor.fetchone() or ("", 0, 0, "")
+        cursor.execute("SELECT code, price, is_package, parent_package, COALESCE(is_camera,0) "
+                       "FROM item_prices WHERE item_name=?", (item_name,))
+        row = cursor.fetchone() or ("", 0, 0, "", 0)
         cursor.execute("SELECT total_count, category, note FROM inventory WHERE item_name=?", (item_name,))
         inv = cursor.fetchone() or (0, "", "")
         cursor.execute("SELECT item_name FROM item_prices WHERE is_package=1 AND item_name<>?", (item_name,))
         packages = [r[0] for r in cursor.fetchall()]
         conn.close()
 
-        lay = QVBoxLayout(self)
-        form = QFormLayout()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(9, 9, 9, 9)
+        outer.setSpacing(7)
+
+        # ---------- فرم داخل ناحیه اسکرول ----------
+        form_widget = QWidget()
+        form = QFormLayout(form_widget)
+        form.setSpacing(6)
+        form.setContentsMargins(0, 0, 0, 0)
 
         self.txt_code = QLineEdit(row[0] or "")
         self.txt_name = QLineEdit(item_name)
         self.txt_price = QLineEdit(f"{row[1]:,}")
         self.txt_price.textChanged.connect(lambda t: self.txt_price.setText(format_number(t)))
+        self.txt_price.textChanged.connect(self.update_profit_hint)
         self.txt_category = QLineEdit(inv[1] or "")
         self.spin_total = QSpinBox()
         self.spin_total.setRange(0, 100000)
         self.spin_total.setValue(int(inv[0] or 0))
         self.txt_note = QLineEdit(inv[2] or "")
+
+        self.chk_camera = QCheckBox("این مورد دوربین است (سود = نصف قیمت)")
+        self.chk_camera.setChecked(bool(row[4]))
+        self.chk_camera.stateChanged.connect(self.update_profit_hint)
+
         self.chk_pkg = QCheckBox("این مورد یک پکیج اصلی است")
         self.chk_pkg.setChecked(bool(row[2]))
+        self.chk_pkg.stateChanged.connect(self.on_pkg_changed)
+
         self.combo_parent = QComboBox()
         self.combo_parent.addItem("--- بدون پکیج مادر ---", "")
         for p in packages:
@@ -3397,25 +3623,37 @@ class ItemEditDialog(QDialog):
             self.combo_parent.setCurrentIndex(idx)
         self.combo_parent.setEnabled(not bool(row[2]))
 
-        form.addRow("کد:", self.txt_code)
-        form.addRow("نام:", self.txt_name)
-        form.addRow("قیمت (تومان):", self.txt_price)
-        form.addRow("دسته‌بندی انبار:", self.txt_category)
-        form.addRow("تعداد کل انبار:", self.spin_total)
-        form.addRow("مشخصات / توضیحات:", self.txt_note)
+        form.addRow(f"{ico('list')} کد:", self.txt_code)
+        form.addRow(f"{ico('list')} نام کالا یا خدمات:", self.txt_name)
+        form.addRow(f"{ico('money')} قیمت (تومان):", self.txt_price)
+        form.addRow(f"{ico('inventory')} دسته‌بندی:", self.txt_category)
+        form.addRow(f"{ico('inventory')} تعداد کل انبار:", self.spin_total)
+        form.addRow(f"{ico('detail')} مشخصات / توضیحات:", self.txt_note)
+        form.addRow("", self.chk_camera)
         form.addRow("", self.chk_pkg)
-        form.addRow("پکیج مادر:", self.combo_parent)
-        lay.addLayout(form)
+        form.addRow(f"{ico('package')} پکیج مادر:", self.combo_parent)
+
+        self.lbl_profit = QLabel("")
+        self.lbl_profit.setWordWrap(True)
+        self.lbl_profit.setStyleSheet("background-color:#eafaf1; border:1px solid #27ae60; "
+                                      "border-radius:7px; padding:7px; font-size:9.5pt;")
+        form.addRow(self.lbl_profit)
 
         note = QLabel(
-            f"{ico('warn')} با تغییر نام یا کد، همه بخش‌ها (قراردادها، فاکتورها و انبار) "
-            "به‌صورت خودکار هماهنگ می‌شوند."
-        )
+            f"{ico('warn')} با تغییر نام یا قیمت، همه بخش‌ها (انبار و لیست فاکتور) هماهنگ می‌شوند، "
+            "ولی <b>قراردادهای ثبت‌شده قبلی تغییر نمی‌کنند</b> و قیمت خودشان را نگه می‌دارند.")
         note.setWordWrap(True)
         note.setStyleSheet("background-color:#fff9e6; border:1px solid #f39c12; "
-                           "border-radius:8px; padding:9px;")
-        lay.addWidget(note)
+                           "border-radius:7px; padding:7px; font-size:9pt;")
+        form.addRow(note)
 
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(form_widget)
+        outer.addWidget(scroll, 1)
+
+        # ---------- دکمه‌ها همیشه پایین و قابل کلیک ----------
         row_btn = QHBoxLayout()
         btn_save = QPushButton(ico_text("save", "ذخیره تغییرات"))
         btn_save.setStyleSheet("background-color:#27ae60; color:white; font-weight:bold; padding:9px;")
@@ -3424,13 +3662,30 @@ class ItemEditDialog(QDialog):
         btn_cancel.clicked.connect(self.reject)
         row_btn.addWidget(btn_save, 2)
         row_btn.addWidget(btn_cancel, 1)
-        lay.addLayout(row_btn)
+        outer.addLayout(row_btn)
+
+        self.update_profit_hint()
+
+    def on_pkg_changed(self):
+        self.combo_parent.setEnabled(not self.chk_pkg.isChecked())
+        if self.chk_pkg.isChecked():
+            self.combo_parent.setCurrentIndex(0)
+
+    def update_profit_hint(self, *args):
+        price = parse_number(self.txt_price.text())
+        if self.chk_camera.isChecked():
+            self.lbl_profit.setText(
+                f"{ico('money')} <b>سود این دوربین (نصف قیمت):</b> {price // 2:,} تومان "
+                f"— از قیمت {price:,} تومان")
+        else:
+            self.lbl_profit.setText(
+                f"{ico('detail')} سود دوربین ثبت نشده است. اگر این قلم دوربین است تیک آن را بزنید.")
 
     def save(self):
         new_name = self.txt_name.text().strip()
         code = self.txt_code.text().strip()
         if not new_name:
-            QMessageBox.warning(self, "خطا", "نام نمی‌تواند خالی باشد.")
+            QMessageBox.warning(self, "خطا", "نام کالا یا خدمات نمی‌تواند خالی باشد.")
             return
         if not code:
             code = generate_unique_code("PKG" if self.chk_pkg.isChecked() else "SRV",
@@ -3449,6 +3704,7 @@ class ItemEditDialog(QDialog):
 
         is_pkg = 1 if self.chk_pkg.isChecked() else 0
         parent = "" if is_pkg else self.combo_parent.currentData()
+        is_camera = 1 if self.chk_camera.isChecked() else 0
 
         ok = sync_item_everywhere(self.old_name, new_name, code,
                                   parse_number(self.txt_price.text()), is_pkg, parent)
@@ -3459,6 +3715,7 @@ class ItemEditDialog(QDialog):
         try:
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
+            cursor.execute("UPDATE item_prices SET is_camera=? WHERE item_name=?", (is_camera, new_name))
             cursor.execute('''
                 INSERT INTO inventory (item_name, total_count, used_count, category, note)
                 VALUES (?, ?, 0, ?, ?)
@@ -3475,7 +3732,10 @@ class ItemEditDialog(QDialog):
             print("[ITEMS] inventory update error:", e)
 
         recalc_inventory_usage()
-        QMessageBox.information(self, "موفقیت", "تغییرات ذخیره و در همه بخش‌ها هماهنگ شد.")
+        QMessageBox.information(
+            self, "موفقیت",
+            "تغییرات ذخیره و در انبار و لیست فاکتور هماهنگ شد.\n"
+            "قراردادهای ثبت‌شده قبلی دست‌نخورده باقی ماندند.")
         self.accept()
 
 
@@ -3648,7 +3908,8 @@ class ContractDetailsDialog(QDialog):
     def __init__(self, contract_id, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"جزئیات کامل قرارداد #{contract_id}")
-        self.resize(780, 680)
+        self.setMinimumSize(520, 400)
+        fit_dialog_to_screen(self, 820, 720)
         persist_dialog(self, "dlg_contract_details")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
@@ -3658,25 +3919,29 @@ class ContractDetailsDialog(QDialog):
         cursor = conn.cursor()
         cursor.execute("""SELECT groom_name, bride_name, groom_phone, bride_phone,
                           contract_date, ceremony_date, selected_items, total_amount,
-                          discount, paid_amount, description, code, staff_ids
+                          discount, paid_amount, description, code, staff_ids,
+                          items_detail, venue, packages_detail
                           FROM wedding_contracts WHERE id=?""", (contract_id,))
         row = cursor.fetchone()
-        items_prices = {}
-        if row and row[6]:
-            for it in str(row[6]).split(','):
-                it = it.strip()
-                if not it:
-                    continue
-                cursor.execute("SELECT code, price, is_package FROM item_prices WHERE item_name=?", (it,))
-                f = cursor.fetchone()
-                items_prices[it] = f if f else ("-", 0, 0)
         conn.close()
+
+        # قیمت‌های «قفل‌شده» در همین قرارداد (نه قیمت فعلی انبار)
+        try:
+            items_detail = json.loads(row[13]) if row and row[13] else {}
+        except Exception:
+            items_detail = {}
+        try:
+            packages_detail = json.loads(row[15]) if row and len(row) > 15 and row[15] else {}
+        except Exception:
+            packages_detail = {}
 
         if row:
             info_text = f"<b>کد قرارداد:</b> {row[11] or '-'}<br>"
             info_text += f"<b>زوجین:</b> {row[0]} و {row[1]}<br>"
             info_text += f"<b>تلفن داماد:</b> {row[2] or '-'} | <b>تلفن عروس:</b> {row[3] or '-'}<br>"
             info_text += f"<b>تاریخ قرارداد:</b> {row[4]} | <b>تاریخ مراسم:</b> {row[5]}<br>"
+            if len(row) > 14 and row[14]:
+                info_text += f"<b>مکان مراسم:</b> {row[14]}<br>"
             info_text += f"<b>توضیحات:</b> {row[10] if row[10] else 'ندارد'}"
             lbl_info = QLabel(info_text)
             lbl_info.setStyleSheet("background-color: #f8f9fa; padding: 12px; "
@@ -3688,23 +3953,48 @@ class ContractDetailsDialog(QDialog):
             layout.addWidget(lbl_items)
 
             table = QTableWidget()
-            table.setColumnCount(4)
-            table.setHorizontalHeaderLabels(["ردیف", "کد", "عنوان خدمت / پکیج", "قیمت (تومان)"])
+            table.setColumnCount(5)
+            table.setHorizontalHeaderLabels(["ردیف", "کد", "شرح خدمات / پکیج", "بهای واحد (تومان)",
+                                             "مبلغ کل (تومان)"])
             table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
             table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
             table.setAlternatingRowColors(True)
             table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            table.verticalHeader().setDefaultSectionSize(28)
 
             items = [x.strip() for x in (row[6].split(',') if row[6] else []) if x.strip()]
-            table.setRowCount(len(items))
-            for idx, item in enumerate(items):
-                info = items_prices.get(item, ("-", 0, 0))
-                table.setItem(idx, 0, QTableWidgetItem(str(idx + 1)))
-                table.setItem(idx, 1, QTableWidgetItem(info[0] or "-"))
-                table.setItem(idx, 2, QTableWidgetItem(
-                    f"{ico('package')} {item}" if info[2] else item))
-                table.setItem(idx, 3, QTableWidgetItem(f"{info[1]:,}"))
+            # همان ریز‌فاکتوری که در چاپ و PDF استفاده می‌شود → نمایش یکسان
+            rows_bd = InvoiceBuilder._items_breakdown(items, items_detail, True, packages_detail)
+            table.setRowCount(len(rows_bd))
+            for idx, r in enumerate(rows_bd):
+                name_item = QTableWidgetItem(r["name"])
+                if r["sub"]:
+                    name_item.setForeground(QColor("#7f8c8d"))
+                table.setItem(idx, 0, QTableWidgetItem(str(r["idx"])))
+                table.setItem(idx, 1, QTableWidgetItem(r["code"]))
+                table.setItem(idx, 2, name_item)
+                table.setItem(idx, 3, QTableWidgetItem(f"{r['price']:,}"))
+                table.setItem(idx, 4, QTableWidgetItem(f"{r['price']:,}"))
             layout.addWidget(table)
+
+            raw = row[7] or 0
+            disc = row[8] or 0
+            paid = row[9] or 0
+            net = max(0, raw - disc)
+            remain = max(0, net - paid)
+            lbl_tot = QLabel(
+                f"<div style='font-size:10.5pt;'>"
+                f"<b>جمع کل (قیمت خام):</b> {raw:,} تومان<br>"
+                f"<b>تخفیف:</b> {disc:,} تومان<br>"
+                f"<b>جمع کل بعد از تخفیف:</b> <span style='color:#2980b9;'>{net:,}</span> تومان<br>"
+                f"<b>جمع بیعانه‌های دریافتی:</b> {paid:,} تومان<br>"
+                f"<b>مانده قابل پرداخت:</b> <span style='color:#c0392b;'>{remain:,}</span> تومان<br>"
+                f"<b>جمع کل به حروف:</b> {number_to_persian_words(net)} تومان"
+                f"</div>")
+            lbl_tot.setWordWrap(True)
+            lbl_tot.setStyleSheet("background-color:#fff9e6; border:1px solid #f39c12; "
+                                  "border-radius:8px; padding:9px;")
+            layout.addWidget(lbl_tot)
 
             # ---- نیروی کار و حقوق این قرارداد ----
             staff = []
@@ -3786,17 +4076,23 @@ class ContractDetailsDialog(QDialog):
 # ================  EditContractDialog  =====================
 # ============================================================
 class EditContractDialog(QDialog):
+    """
+    ویرایش قرارداد (نسخه ۱۲):
+      • همه مفاد انتخاب‌شده با قیمت‌شان در یک کادر جداگانه نمایش داده می‌شوند
+      • بخش «دوربین‌ها و خدمات» و بخش «پکیج‌ها» از هم جدا هستند
+      • قیمت پکیج فقط از انبار می‌آید و در قرارداد قابل تغییر نیست
+      • ریز آیتم‌های پکیج در همین قرارداد قفل می‌شود
+    """
+
     def __init__(self, contract_id, parent=None):
         super().__init__(parent)
         self.contract_id = contract_id
         self.setWindowTitle(f"ویرایش قرارداد #{contract_id}")
-        self.resize(780, 860)
-        persist_dialog(self, "dlg_edit_contract")
         self.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
         self.setFont(QFont(APP_FONT_FAMILY, 10))
-
-        layout = QVBoxLayout()
-        form_layout = QFormLayout()
+        self.setMinimumSize(520, 400)
+        fit_dialog_to_screen(self, 820, 780)
+        persist_dialog(self, "dlg_edit_contract")
 
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -3806,13 +4102,26 @@ class EditContractDialog(QDialog):
                           FROM wedding_contracts WHERE id=?""", (contract_id,))
         row = cursor.fetchone()
 
-        cursor.execute("SELECT item_name, code, price, is_package, parent_package "
-                       "FROM item_prices ORDER BY is_package DESC, parent_package, item_name")
+        cursor.execute("SELECT item_name, code, price, is_package, parent_package, "
+                       "COALESCE(is_camera,0) FROM item_prices ORDER BY is_package, item_name")
         all_items = cursor.fetchall()
 
         cursor.execute("SELECT id, code, name, role FROM persons ORDER BY name")
         all_persons = cursor.fetchall()
         conn.close()
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(9, 9, 9, 9)
+        outer.setSpacing(7)
+
+        # ---------- فرم داخل ناحیه اسکرول ----------
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(7)
+        form_layout = QFormLayout()
+        form_layout.setSpacing(6)
+        form_layout.setContentsMargins(0, 0, 0, 0)
 
         self.groom = QLineEdit(row[0] if row else "")
         self.bride = QLineEdit(row[1] if row else "")
@@ -3820,13 +4129,13 @@ class EditContractDialog(QDialog):
         self.bride_phone = QLineEdit(row[3] if row else "")
         self.contract_date = PersianDateEdit(date_str=row[4] if row and row[4] else None)
         self.ceremony_date = PersianDateEdit(date_str=row[5] if row and row[5] else None)
+        self.venue = QLineEdit(row[12] if row and len(row) > 12 else "")
+        self.venue.setPlaceholderText("نام تالار / باغ / مکان برگزاری مراسم")
         self.discount = QLineEdit(f"{row[8]:,}" if row else "0")
         self.discount.textChanged.connect(lambda t: self.discount.setText(format_number(t)))
         self.discount.textChanged.connect(lambda _: self.recalc())
-        self.venue = QLineEdit(row[12] if row and len(row) > 12 else "")
-        self.venue.setPlaceholderText("نام تالار / باغ / مکان برگزاری مراسم")
         self.desc = QTextEdit(row[9] if row else "")
-        self.desc.setFixedHeight(60)
+        self.desc.setFixedHeight(58)
 
         form_layout.addRow(f"{ico('wedding')} نام داماد:", self.groom)
         form_layout.addRow(f"{ico('wedding')} نام عروس:", self.bride)
@@ -3836,56 +4145,120 @@ class EditContractDialog(QDialog):
         form_layout.addRow(f"{ico('calendar')} تاریخ مراسم (روز/ماه/سال):", self.ceremony_date)
         form_layout.addRow(f"{ico('home')} مکان مراسم:", self.venue)
         form_layout.addRow(f"{ico('money')} تخفیف (تومان):", self.discount)
+        form_layout.addRow(f"{ico('edit')} توضیحات:", self.desc)
+        layout.addLayout(form_layout)
+
+        # ---------- مفاد انتخاب‌شده (نمایش زنده) ----------
+        self.lbl_selected = QLabel("")
+        self.lbl_selected.setWordWrap(True)
+        self.lbl_selected.setStyleSheet("background-color:#e8f8f5; border:1px solid #16a085; "
+                                        "border-radius:8px; padding:9px; font-size:10pt;")
+        sel_box = QGroupBox("مفاد انتخاب‌شده در این قرارداد")
+        sel_box.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
+        sb = QVBoxLayout()
+        sb.addWidget(self.lbl_selected)
+        sel_box.setLayout(sb)
+        layout.addWidget(sel_box)
 
         selected = [x.strip() for x in (row[6].split(',') if row and row[6] else []) if x.strip()]
-        items_box = QGroupBox("مفاد فاکتور (تیک بزنید — روی پکیج دوبار کلیک کنید تا جزئیاتش را ببینید)")
-        items_box_layout = QVBoxLayout()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setFixedHeight(240)
 
-        inner = QWidget()
-        inner_layout = QVBoxLayout()
+        services = [r for r in all_items if r[3] == 0]
+        packages = [r for r in all_items if r[3] == 1]
+        subs_count = {}
+        for r in services:
+            if r[4]:
+                subs_count[r[4]] = subs_count.get(r[4], 0) + 1
+
         self.item_checks = {}
         self.item_prices = {}
         self.item_is_pkg = {}
-        for item_name, code, price, is_pkg, parent in all_items:
+        self.pkg_prices = {}
+
+        # ---- بخش خدمات ----
+        items_box = QGroupBox("مفاد فاکتور — دوربین‌ها و خدمات (تکی)")
+        items_box.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
+        ib = QVBoxLayout()
+        ib.setSpacing(2)
+        for name, code, price, _p, parent, is_cam in services:
             row_w = QWidget()
-            row_l = QHBoxLayout()
             row_w.setFixedHeight(26)
+            row_l = QHBoxLayout(row_w)
             row_l.setContentsMargins(16 if parent else 0, 0, 0, 0)
             row_l.setSpacing(5)
-            cb = ElidedCheckBox(f"{'• ' if parent else ''}[{code or '-'}] {item_name}")
-            cb.setFont(QFont(APP_FONT_FAMILY, 9))
-            cb.setChecked(item_name in selected)
+            cam = ico("camera") + " " if (is_cam and not parent) else ""
+            cb = ElidedCheckBox(f"{'• ' if parent else ''}{cam}[{code or '-'}] {name}")
+            cb.setFont(QFont(APP_FONT_FAMILY, 9, QFont.Weight.Normal if parent else QFont.Weight.Bold))
+            cb.setChecked(name in selected)
+            cb.setToolTip(f"{name}\nقیمت انبار: {int(price or 0):,} تومان"
+                          + (f"\nسود هر دوربین: {(int(price or 0) // 2):,} تومان" if is_cam else ""))
             cb.stateChanged.connect(self.recalc)
-            txt = QLineEdit(f"{price:,}")
-            txt.setFixedWidth(120)
+            txt = QLineEdit(f"{int(price or 0):,}")
+            txt.setFixedWidth(90)
+            txt.setFixedHeight(22)
+            txt.setFont(QFont(APP_FONT_FAMILY, 9))
+            txt.setToolTip("قیمت در این قرارداد (روی قیمت انبار اثری ندارد)")
             txt.textChanged.connect(lambda t, p=txt: p.setText(format_number(t)))
             txt.textChanged.connect(self.recalc)
-            self.item_checks[item_name] = cb
-            self.item_prices[item_name] = txt
-            self.item_is_pkg[item_name] = is_pkg
-            row_l.addWidget(cb)
-            row_l.addStretch()
-            if is_pkg:
-                btn_det = QPushButton(ico("detail"))
-                btn_det.setFixedWidth(34)
-                btn_det.setToolTip("نمایش جزئیات کامل این پکیج")
-                btn_det.clicked.connect(lambda _, n=item_name: self.show_pkg(n))
-                row_l.addWidget(btn_det)
-            row_l.addWidget(QLabel("قیمت:"))
+            self.item_checks[name] = cb
+            self.item_prices[name] = txt
+            self.item_is_pkg[name] = 0
+            row_l.addWidget(cb, 1)
             row_l.addWidget(txt)
             row_w.setLayout(row_l)
-            inner_layout.addWidget(row_w)
-        inner.setLayout(inner_layout)
-        scroll.setWidget(inner)
-        items_box_layout.addWidget(scroll)
-        items_box.setLayout(items_box_layout)
-        form_layout.addRow(items_box)
+            ib.addWidget(row_w)
+        items_box.setLayout(ib)
+        layout.addWidget(items_box)
 
-        # ---------- نیروی کار این قرارداد ----------
+        # ---- بخش پکیج‌ها ----
+        pkg_box = QGroupBox("پکیج‌ها (نام پکیج — برای چیدن آیتم‌ها «مدیریت پکیج» را بزنید)")
+        pkg_box.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
+        pb = QVBoxLayout()
+        pb.setSpacing(2)
+        if not packages:
+            lblp = QLabel("پکیجی ثبت نشده است.")
+            lblp.setStyleSheet("color:#7f8c8d; padding:5px;")
+            pb.addWidget(lblp)
+        for name, code, price, _p, _par, _cam in packages:
+            n = subs_count.get(name, 0)
+            row_w = QWidget()
+            row_w.setFixedHeight(28)
+            row_l = QHBoxLayout(row_w)
+            row_l.setContentsMargins(0, 0, 0, 0)
+            row_l.setSpacing(5)
+            cb = ElidedCheckBox(f"{ico('package')} {name}")
+            cb.setFont(QFont(APP_FONT_FAMILY, 9, QFont.Weight.Bold))
+            cb.setChecked(name in selected)
+            if n <= 0:
+                cb.setEnabled(False)
+                cb.setChecked(False)
+                cb.setToolTip("این پکیج خالی است؛ ابتدا با «مدیریت پکیج» آیتم اضافه کنید.")
+            else:
+                cb.setToolTip(f"{name}\n{n} آیتم\nقیمت در انبار: {int(price or 0):,} تومان")
+            cb.stateChanged.connect(self.recalc)
+
+            btn = QPushButton(ico_text("edit", "مدیریت پکیج"))
+            btn.setFixedHeight(22)
+            btn.setStyleSheet("background-color:#8e44ad; color:white; font-weight:bold; "
+                              "padding:2px 8px; font-size:8.5pt;")
+            btn.clicked.connect(lambda _, pn=name: self.manage_package(pn))
+
+            lbl_n = QLabel(f"{n} آیتم" if n else "خالی")
+            lbl_n.setFixedWidth(52)
+            lbl_n.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl_n.setStyleSheet("font-size:8.5pt; color:" + ("#1e8449" if n else "#c0392b") + ";")
+
+            self.item_checks[name] = cb
+            self.item_is_pkg[name] = 1
+            self.pkg_prices[name] = int(price or 0)
+            row_l.addWidget(cb, 1)
+            row_l.addWidget(lbl_n)
+            row_l.addWidget(btn)
+            row_w.setLayout(row_l)
+            pb.addWidget(row_w)
+        pkg_box.setLayout(pb)
+        layout.addWidget(pkg_box)
+
+        # ---------- نیروی کار ----------
         saved_staff = {}
         try:
             for m in (json.loads(row[10]) if row and row[10] else []):
@@ -3893,95 +4266,153 @@ class EditContractDialog(QDialog):
         except Exception:
             saved_staff = {}
 
-        staff_box = QGroupBox("نیروی کار این قرارداد (تیک بزنید و حقوق همان قرارداد را وارد کنید)")
-        staff_box_layout = QVBoxLayout()
-        staff_scroll = QScrollArea()
-        staff_scroll.setWidgetResizable(True)
-        staff_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        staff_scroll.setFixedHeight(150)
-        staff_inner = QWidget()
-        staff_inner_layout = QVBoxLayout()
+        staff_box = QGroupBox("نیروی کار این قرارداد")
+        staff_box.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
+        sb2 = QVBoxLayout()
+        sb2.setSpacing(2)
         self.staff_checks = {}
         self.staff_wages = {}
         self.staff_meta = {}
+        if not all_persons:
+            sb2.addWidget(QLabel("هنوز نیرویی در بخش «کارکنان» تعریف نشده است."))
         for pid, pcode, pname, prole in all_persons:
             row_w = QWidget()
-            row_l = QHBoxLayout()
+            row_w.setFixedHeight(26)
+            row_l = QHBoxLayout(row_w)
             row_l.setContentsMargins(0, 0, 0, 0)
-            cb = QCheckBox(f"[{pcode or '-'}] {pname} ({prole})")
+            row_l.setSpacing(5)
+            cb = ElidedCheckBox(f"[{pcode or '-'}] {pname} ({prole})")
+            cb.setFont(QFont(APP_FONT_FAMILY, 9))
             cb.setChecked(pid in saved_staff)
             wage = QLineEdit(f"{saved_staff.get(pid, 0):,}")
-            wage.setFixedWidth(130)
+            wage.setFixedWidth(90)
+            wage.setFixedHeight(22)
+            wage.setFont(QFont(APP_FONT_FAMILY, 9))
             wage.textChanged.connect(lambda t, p=wage: p.setText(format_number(t)))
             wage.textChanged.connect(self.recalc)
+            cb.stateChanged.connect(self.recalc)
             self.staff_checks[pid] = cb
             self.staff_wages[pid] = wage
             self.staff_meta[pid] = (pname, prole)
-            row_l.addWidget(cb)
-            row_l.addStretch()
-            row_l.addWidget(QLabel("حقوق این قرارداد:"))
+            row_l.addWidget(cb, 1)
             row_l.addWidget(wage)
             row_w.setLayout(row_l)
-            staff_inner_layout.addWidget(row_w)
-        if not all_persons:
-            staff_inner_layout.addWidget(QLabel("هنوز هیچ نیرویی در بخش «کارکنان» تعریف نشده است."))
-        staff_inner.setLayout(staff_inner_layout)
-        staff_scroll.setWidget(staff_inner)
-        staff_box_layout.addWidget(staff_scroll)
-        staff_box.setLayout(staff_box_layout)
-        form_layout.addRow(staff_box)
+            sb2.addWidget(row_w)
+        staff_box.setLayout(sb2)
+        layout.addWidget(staff_box)
 
         self.lbl_calc = QLabel("")
         self.lbl_calc.setWordWrap(True)
-        self.lbl_calc.setStyleSheet("background-color:#e8f8f5; border:1px solid #16a085; "
-                                    "border-radius:8px; padding:10px; font-size:11pt;")
-        form_layout.addRow(self.lbl_calc)
+        self.lbl_calc.setStyleSheet("background-color:#fff9e6; border:1px solid #f39c12; "
+                                    "border-radius:8px; padding:9px; font-size:10pt;")
+        layout.addWidget(self.lbl_calc)
 
-        form_layout.addRow(f"{ico('edit')} توضیحات:", self.desc)
-        layout.addLayout(form_layout)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
 
+        # ---------- دکمه‌ها ----------
         btn_row = QHBoxLayout()
         btn_save = QPushButton(ico_text("save", "ذخیره تغییرات"))
         btn_save.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 10px;")
         btn_save.clicked.connect(self.save_changes)
-
         btn_cancel = QPushButton(ico_text("cancel", "لغو"))
         btn_cancel.clicked.connect(self.reject)
-
         btn_row.addWidget(btn_save, 2)
         btn_row.addWidget(btn_cancel, 1)
-        layout.addLayout(btn_row)
+        outer.addLayout(btn_row)
 
-        self.setLayout(layout)
         self.recalc()
 
-    def show_pkg(self, name):
-        PackageDetailsDialog(name, self).exec()
+    def manage_package(self, pkg_name):
+        dlg = PackageDetailsDialog(pkg_name, self)
+        accepted = (dlg.exec() == QDialog.DialogCode.Accepted)
+        if accepted:
+            self.reload_items()
+            cb = self.item_checks.get(getattr(dlg, "pkg_name", pkg_name) or pkg_name)
+            if cb is not None and cb.isEnabled():
+                cb.setChecked(True)
+        self.recalc()
+
+    def reload_items(self):
+        """بازخوانی فهرست کالاها و پکیج‌ها پس از تغییر در انبار"""
+        # به‌روزرسانی قیمت‌ها و وضعیت پکیج‌ها از دیتابیس انبار
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            for name in list(self.item_checks.keys()):
+                cursor.execute("SELECT price, is_package FROM item_prices WHERE item_name=?", (name,))
+                r = cursor.fetchone()
+                if not r:
+                    continue
+                if self.item_is_pkg.get(name):
+                    self.pkg_prices[name] = int(r[0] or 0)
+                    cursor.execute("SELECT COUNT(*) FROM item_prices WHERE parent_package=?", (name,))
+                    n = cursor.fetchone()[0]
+                    cb = self.item_checks[name]
+                    cb.setEnabled(n > 0)
+                    if n <= 0:
+                        cb.setChecked(False)
+                else:
+                    pass
+            conn.close()
+        except Exception as e:
+            print("[EDIT] reload error:", e)
+        self.recalc()
+
+    def _item_price(self, name):
+        w = self.item_prices.get(name)
+        if w is not None:
+            return parse_number(w.text())
+        return int(self.pkg_prices.get(name, 0))
 
     def recalc(self):
         if not hasattr(self, "lbl_calc"):
             return
         raw = 0
-        for item_name, cb in self.item_checks.items():
+        chosen = []
+        for name, cb in self.item_checks.items():
             if cb.isChecked():
-                raw += parse_number(self.item_prices[item_name].text())
+                pr = self._item_price(name)
+                raw += pr
+                tag = "پکیج" if self.item_is_pkg.get(name) else "خدمت"
+                chosen.append((name, pr, tag))
+
         discount = parse_number(self.discount.text())
         net = max(0, raw - discount)
+
         staff_total = 0
-        count_staff = 0
-        for pid, cb in getattr(self, "staff_checks", {}).items():
+        staff_n = 0
+        for pid, cb in self.staff_checks.items():
             if cb.isChecked():
-                count_staff += 1
+                staff_n += 1
                 staff_total += parse_number(self.staff_wages[pid].text())
 
+        # ---- کادر مفاد انتخاب‌شده ----
+        if chosen:
+            lines = "".join(
+                f"<div style='margin:1px 0;'>"
+                f"<span style='color:#7f8c8d;'>[{tag}]</span> "
+                f"<b>{n}</b> — {pr:,} تومان</div>"
+                for n, pr, tag in chosen)
+            self.lbl_selected.setText(
+                f"<div style='font-size:10pt;'><b>تعداد موارد:</b> {len(chosen)} "
+                f"(پکیج: {len([c for c in chosen if c[2] == 'پکیج'])}) | "
+                f"<b>جمع خام:</b> {raw:,} تومان</div>"
+                f"<hr style='border:0; border-top:1px solid #a9d3ee;'>{lines}")
+        else:
+            self.lbl_selected.setText(
+                "<span style='color:#7f8c8d;'>هنوز موردی انتخاب نشده است. از کادرهای پایین "
+                "دوربین‌ها، خدمات یا پکیج‌ها را تیک بزنید.</span>")
+
         self.lbl_calc.setText(
-            f"<b>جمع قیمت خام:</b> {raw:,} تومان  |  "
-            f"<b>تخفیف:</b> {discount:,} تومان  |  "
+            f"<b>جمع قیمت خام:</b> {raw:,} تومان | "
+            f"<b>تخفیف:</b> {discount:,} تومان | "
             f"<b>جمع کل بعد از تخفیف:</b> <span style='color:#2980b9;'>{net:,} تومان</span><br>"
             f"<b>مبلغ به حروف:</b> {number_to_persian_words(net)} تومان<br>"
-            f"<b>نیروی کار انتخاب‌شده:</b> {count_staff} نفر  |  "
-            f"<b>جمع حقوق این قرارداد:</b> {staff_total:,} تومان"
-        )
+            f"<b>نیروی کار:</b> {staff_n} نفر | <b>جمع حقوق این قرارداد:</b> {staff_total:,} تومان")
 
     def save_changes(self):
         if not ask_security_password(self):
@@ -3992,10 +4423,12 @@ class EditContractDialog(QDialog):
         for item_name, cb in self.item_checks.items():
             if cb.isChecked():
                 selected_items.append(item_name)
-                raw_total += parse_number(self.item_prices[item_name].text())
+                raw_total += self._item_price(item_name)
 
         discount = parse_number(self.discount.text())
         net_total = max(0, raw_total - discount)
+
+        items_detail = {n: self._item_price(n) for n in selected_items}
 
         staff_list = []
         for pid, cb in self.staff_checks.items():
@@ -4006,6 +4439,24 @@ class EditContractDialog(QDialog):
                     "wage": parse_number(self.staff_wages[pid].text()),
                 })
 
+        # قفل کردن ریز آیتم‌های پکیج در همین قرارداد
+        packages_detail = {}
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            for it in selected_items:
+                cursor.execute("SELECT is_package FROM item_prices WHERE item_name=?", (it,))
+                r = cursor.fetchone()
+                if not (r and r[0] == 1):
+                    continue
+                cursor.execute("SELECT item_name, code, price FROM item_prices "
+                               "WHERE parent_package=? ORDER BY item_name", (it,))
+                packages_detail[it] = [{"name": x[0], "code": x[1] or "", "price": int(x[2] or 0)}
+                                       for x in cursor.fetchall()]
+            conn.close()
+        except Exception as e:
+            print("[EDIT] package snapshot error:", e)
+
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("SELECT paid_amount FROM wedding_contracts WHERE id=?", (self.contract_id,))
@@ -4013,22 +4464,22 @@ class EditContractDialog(QDialog):
         paid = (r[0] or 0) if r else 0
         is_settled = 1 if (net_total - paid) <= 0 else 0
 
-        # جمع کل = قیمت خام (بدون تخفیف) ذخیره می‌شود تا فاکتور بتواند
-        # هم «جمع خام» و هم «جمع بعد از تخفیف» را جداگانه نشان دهد.
         cursor.execute("""UPDATE wedding_contracts SET
             groom_name=?, bride_name=?, groom_phone=?, bride_phone=?,
             contract_date=?, ceremony_date=?, selected_items=?,
-            total_amount=?, discount=?, description=?, staff_ids=?, is_settled=?, venue=?
+            total_amount=?, discount=?, description=?, staff_ids=?, is_settled=?, venue=?,
+            packages_detail=?, items_detail=?
             WHERE id=?""",
             (self.groom.text(), self.bride.text(), self.groom_phone.text(),
              self.bride_phone.text(), self.contract_date.text(), self.ceremony_date.text(),
              ",".join(selected_items), raw_total, discount,
              self.desc.toPlainText(), json.dumps(staff_list, ensure_ascii=False),
-             is_settled, self.venue.text().strip(), self.contract_id))
+             is_settled, self.venue.text().strip(),
+             json.dumps(packages_detail, ensure_ascii=False),
+             json.dumps(items_detail, ensure_ascii=False), self.contract_id))
         conn.commit()
         conn.close()
 
-        # انبار و کارکنان بلافاصله با قرارداد هماهنگ می‌شوند
         recalc_inventory_usage()
         sync_contract_staff({
             "id": self.contract_id,
@@ -4039,7 +4490,10 @@ class EditContractDialog(QDialog):
             "staff": staff_list,
         })
 
-        QMessageBox.information(self, "موفقیت", "تغییرات با موفقیت ذخیره و همه بخش‌ها هماهنگ شد.")
+        QMessageBox.information(
+            self, "موفقیت",
+            "تغییرات قرارداد ذخیره شد.\n"
+            "قیمت‌های انبار دست‌نخورده ماندند و ریز پکیج‌ها در این قرارداد قفل شد.")
         self.accept()
 
     def _contract_code(self):
@@ -4185,7 +4639,7 @@ class InvoiceBuilder:
         parts = []
         for c in cells:
             parts.append(
-                f"<th style='border:1px solid #8a8a8a; padding:3px 4px; "
+                f"<th dir='rtl' style='border:1px solid #8a8a8a; padding:3px 4px; "
                 f"background-color:{bg}; color:{fg}; font-size:{size};'>{c}</th>")
         return f"<tr>{InvoiceBuilder._rev(parts)}</tr>"
 
@@ -4203,13 +4657,20 @@ class InvoiceBuilder:
         cs = f" colspan='{colspan}'" if colspan else ""
         # عرض ستون باید اتریبیوت HTML باشد؛ موتور متن Qt مقدار CSS آن را نادیده می‌گیرد
         ws = f" width='{width}'" if width else ""
-        return f"<td{cs}{ws} style='{';'.join(st)};'>{text}</td>"
+        # dir='rtl' جهت پاراگراف را صریح راست‌به‌چپ می‌کند تا علامت «:» همیشه
+        # در سمت چپ متن فارسی قرار بگیرد (دقیقاً مثل خروجی PDF)
+        return f"<td{cs}{ws} dir='rtl' style='{';'.join(st)};'>{text}</td>"
 
     @staticmethod
-    def _items_breakdown(selected_items, items_detail, with_details=True):
-        """سطرهای مفاد فاکتور همراه با زیرمجموعه پکیج‌ها (در صورت انتخاب)"""
+    def _items_breakdown(selected_items, items_detail, with_details=True, packages_detail=None):
+        """
+        سطرهای مفاد فاکتور همراه با آیتم‌های پکیج (در صورت انتخاب).
+        از packages_detail که در زمان ثبت قرارداد ذخیره شده استفاده می‌شود تا
+        تغییرات بعدی انبار روی قراردادهای قدیمی اثر نگذارد.
+        """
         rows = []
         idx = 0
+        packages_detail = packages_detail or {}
         try:
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
@@ -4225,13 +4686,18 @@ class InvoiceBuilder:
                 rows.append({"idx": idx, "code": code or "-", "name": item,
                              "price": int(price or 0), "sub": False})
                 if with_details and is_pkg:
-                    cursor.execute("SELECT item_name, code, price FROM item_prices "
-                                   "WHERE parent_package=? ORDER BY item_name", (item,))
-                    for sname, scode, sprice in cursor.fetchall():
+                    snap = packages_detail.get(item)
+                    if snap is None:
+                        # سازگاری با قراردادهای قدیمی که snapshot ندارند
+                        cursor.execute("SELECT item_name, code, price FROM item_prices "
+                                       "WHERE parent_package=? ORDER BY item_name", (item,))
+                        snap = [{"name": x[0], "code": x[1] or "", "price": int(x[2] or 0)}
+                                for x in cursor.fetchall()]
+                    for s in snap:
                         idx += 1
-                        rows.append({"idx": idx, "code": scode or "-",
-                                     "name": f"• {sname}", "price": int(sprice or 0),
-                                     "sub": True})
+                        rows.append({"idx": idx, "code": s.get("code") or "-",
+                                     "name": f"• {s.get('name','-')}",
+                                     "price": int(s.get("price") or 0), "sub": True})
             conn.close()
         except Exception as e:
             print("[INVOICE] breakdown error:", e)
@@ -4271,7 +4737,8 @@ class InvoiceBuilder:
         cursor = conn.cursor()
         cursor.execute("""SELECT id, code, groom_name, bride_name, groom_phone, bride_phone,
                           contract_date, ceremony_date, selected_items, total_amount,
-                          discount, paid_amount, description, items_detail, staff_ids, venue
+                          discount, paid_amount, description, items_detail, staff_ids, venue,
+                          packages_detail
                           FROM wedding_contracts WHERE id=?""", (contract_id,))
         c = cursor.fetchone()
 
@@ -4298,8 +4765,10 @@ class InvoiceBuilder:
         items_list = [x.strip() for x in (c[8].split(',') if c[8] else []) if x.strip()]
         items_detail = InvoiceBuilder._safe_json(c[13], {})
         staff_list = InvoiceBuilder._safe_json(c[14], [])
+        packages_detail = InvoiceBuilder._safe_json(c[16] if len(c) > 16 else None, {})
 
-        rows = InvoiceBuilder._items_breakdown(items_list, items_detail, with_details)
+        rows = InvoiceBuilder._items_breakdown(items_list, items_detail, with_details,
+                                               packages_detail)
 
         # ---------- سربرگ ----------
         header = InvoiceBuilder._title_band(
@@ -5735,6 +6204,11 @@ class StudioAccountingApp(QMainWindow):
             self.load_item_checkboxes()
 
     def load_item_checkboxes(self):
+        """
+        دو بخش مجزا در قرارداد (نسخه ۱۲):
+          ۱) دوربین‌ها و خدمات انبار: تکی، قابل تیک و با قیمت قابل تغییر در همین قرارداد
+          ۲) پکیج‌ها: فقط نام پکیج بدون قیمت؛ با دکمه «مدیریت» آیتم‌ها چیده می‌شوند
+        """
         for i in reversed(range(self.items_vbox.count())):
             widget = self.items_vbox.itemAt(i).widget()
             if widget:
@@ -5743,63 +6217,179 @@ class StudioAccountingApp(QMainWindow):
         self.item_checkboxes = {}
         self.item_price_inputs = {}
         self.item_is_pkg = {}
+        self.item_package_prices = {}
 
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute("SELECT item_name, code, price, is_package, parent_package FROM item_prices "
-                       "ORDER BY is_package DESC, parent_package, item_name")
+        cursor.execute("SELECT item_name, code, price, is_package, parent_package, "
+                       "COALESCE(is_camera,0) FROM item_prices ORDER BY is_package, item_name")
         rows = cursor.fetchall()
         conn.close()
 
+        services = [r for r in rows if r[3] == 0]
         packages = [r for r in rows if r[3] == 1]
-        singles = [r for r in rows if r[3] == 0]
+        subs_count = {}
+        for r in services:
+            if r[4]:
+                subs_count[r[4]] = subs_count.get(r[4], 0) + 1
 
-        def add_row(item_name, code, price, is_pkg, indent=False):
-            row_w = QWidget()
-            row_w.setFixedHeight(26)
-            row_l = QHBoxLayout(row_w)
-            row_l.setContentsMargins(16 if indent else 0, 0, 0, 0)
-            row_l.setSpacing(5)
+        # ---------------- بخش ۱: دوربین‌ها و خدمات ----------------
+        n_cam = len([r for r in services if r[5] and not r[4]])
+        head1 = QLabel(f"{ico('camera')} <b>دوربین‌ها و خدمات (تکی)</b> — "
+                       f"{len(services)} مورد | {n_cam} دوربین — "
+                       f"قیمت هر مورد فقط برای همین قرارداد قابل تغییر است")
+        head1.setStyleSheet("background-color:#eaf6ff; border:1px solid #a9d3ee; "
+                            "border-radius:6px; padding:5px; font-size:9pt;")
+        head1.setWordWrap(True)
+        self.items_vbox.addWidget(head1)
 
-            cb = ElidedCheckBox(f"{'• ' if indent else ''}[{code or '-'}] {item_name}")
-            cb.setFont(QFont(APP_FONT_FAMILY, 9,
-                             QFont.Weight.Normal if indent else QFont.Weight.Bold))
-            cb.setToolTip(f"{item_name}  ({price:,} تومان)")
-            cb.stateChanged.connect(self.calc_wedding_total)
+        for name, code, price, _is_pkg, parent, is_cam in services:
+            self._add_service_row(name, code, price, is_cam, indent=bool(parent))
 
-            txt_p = QLineEdit(f"{price:,}")
-            txt_p.setFixedWidth(90)
-            txt_p.setFixedHeight(22)
-            txt_p.setFont(QFont(APP_FONT_FAMILY, 9))
-            txt_p.setToolTip("قیمت این مورد در این قرارداد")
-            txt_p.textChanged.connect(lambda t, p=txt_p: p.setText(format_number(t)))
-            txt_p.textChanged.connect(self.calc_wedding_total)
+        # ---------------- بخش ۲: پکیج‌ها ----------------
+        head2 = QLabel(f"{ico('package')} <b>پکیج‌ها</b> — {len(packages)} پکیج — "
+                       "روی «مدیریت پکیج» بزنید، آیتم‌ها را بچینید و «تکمیل پکیج» را بزنید")
+        head2.setStyleSheet("background-color:#f3ecfb; border:1px solid #c9a7e8; "
+                            "border-radius:6px; padding:5px; font-size:9pt;")
+        head2.setWordWrap(True)
+        self.items_vbox.addWidget(head2)
 
-            row_l.addWidget(cb, 1)
-            if is_pkg:
-                btn_det = QPushButton(ico("detail"))
-                btn_det.setFixedSize(24, 22)
-                btn_det.setToolTip("مدیریت و جزئیات کامل این پکیج")
-                btn_det.clicked.connect(lambda _, n=item_name: self.show_package_details_from_tab(n))
-                row_l.addWidget(btn_det)
-            row_l.addWidget(txt_p)
-            row_w.setLayout(row_l)
+        for name, code, price, _is_pkg, _parent, _is_cam in packages:
+            self._add_package_row(name, code, price, subs_count.get(name, 0))
 
-            self.items_vbox.addWidget(row_w)
-            self.item_checkboxes[item_name] = cb
-            self.item_price_inputs[item_name] = txt_p
-            self.item_is_pkg[item_name] = is_pkg
-
-        for pkg in packages:
-            add_row(pkg[0], pkg[1], pkg[2], 1, indent=False)
-            for sub in [s for s in singles if s[4] == pkg[0]]:
-                add_row(sub[0], sub[1], sub[2], 0, indent=True)
-
-        for ind in [s for s in singles if not s[4]]:
-            add_row(ind[0], ind[1], ind[2], 0, indent=False)
+        if not packages:
+            lbl = QLabel("هنوز پکیجی ساخته نشده است. از «مدیریت کالاها، خدمات، پکیج‌ها و انبار» "
+                         "یک مورد را به‌عنوان پکیج ثبت کنید.")
+            lbl.setStyleSheet("color:#7f8c8d; font-size:9pt; padding:6px;")
+            lbl.setWordWrap(True)
+            self.items_vbox.addWidget(lbl)
 
         self.items_vbox.addStretch()
         self.calc_wedding_total()
+
+    def _add_service_row(self, item_name, code, price, is_camera, indent=False):
+        row_w = QWidget()
+        row_w.setFixedHeight(26)
+        row_l = QHBoxLayout(row_w)
+        row_l.setContentsMargins(16 if indent else 0, 0, 0, 0)
+        row_l.setSpacing(5)
+
+        cam_icon = ico("camera") + " " if (is_camera and not indent) else ""
+        cb = ElidedCheckBox(f"{'• ' if indent else ''}{cam_icon}[{code or '-'}] {item_name}")
+        cb.setFont(QFont(APP_FONT_FAMILY, 9, QFont.Weight.Normal if indent else QFont.Weight.Bold))
+        tip = f"{item_name}\nقیمت انبار: {int(price or 0):,} تومان"
+        if is_camera:
+            tip += f"\nسود هر دوربین (نصف قیمت): {(int(price or 0) // 2):,} تومان"
+        cb.setToolTip(tip)
+        cb.stateChanged.connect(self.calc_wedding_total)
+
+        txt_p = QLineEdit(f"{int(price or 0):,}")
+        txt_p.setFixedWidth(90)
+        txt_p.setFixedHeight(22)
+        txt_p.setFont(QFont(APP_FONT_FAMILY, 9))
+        txt_p.setToolTip("قیمت این مورد در همین قرارداد (روی قیمت انبار اثری ندارد)")
+        txt_p.textChanged.connect(lambda t, p=txt_p: p.setText(format_number(t)))
+        txt_p.textChanged.connect(self.calc_wedding_total)
+
+        row_l.addWidget(cb, 1)
+        row_l.addWidget(txt_p)
+        row_w.setLayout(row_l)
+
+        self.items_vbox.addWidget(row_w)
+        self.item_checkboxes[item_name] = cb
+        self.item_price_inputs[item_name] = txt_p
+        self.item_is_pkg[item_name] = 0
+
+    def _add_package_row(self, pkg_name, code, price, subs_n):
+        row_w = QWidget()
+        row_w.setFixedHeight(28)
+        row_l = QHBoxLayout(row_w)
+        row_l.setContentsMargins(0, 0, 0, 0)
+        row_l.setSpacing(5)
+
+        cb = ElidedCheckBox(f"{ico('package')} {pkg_name}")
+        cb.setFont(QFont(APP_FONT_FAMILY, 9, QFont.Weight.Bold))
+        if subs_n <= 0:
+            cb.setEnabled(False)
+            cb.setChecked(False)
+            cb.setToolTip("این پکیج هیچ آیتمی ندارد؛ ابتدا با «مدیریت پکیج» آیتم اضافه کنید و "
+                          "«تکمیل پکیج» را بزنید.")
+        else:
+            cb.setToolTip(f"{pkg_name}\nتعداد آیتم‌ها: {subs_n}\n"
+                          f"قیمت پکیج در انبار: {int(price or 0):,} تومان")
+        cb.stateChanged.connect(self.calc_wedding_total)
+
+        btn_manage = QPushButton(ico_text("edit", "مدیریت پکیج"))
+        btn_manage.setFixedHeight(22)
+        btn_manage.setStyleSheet("background-color:#8e44ad; color:white; font-weight:bold; "
+                                 "padding:2px 8px; font-size:8.5pt;")
+        btn_manage.setToolTip("افزودن یا حذف آیتم‌های این پکیج و تکمیل آن")
+        btn_manage.clicked.connect(lambda _, n=pkg_name: self.manage_package(n))
+
+        lbl_n = QLabel(f"{subs_n} آیتم" if subs_n else "خالی")
+        lbl_n.setFixedWidth(52)
+        lbl_n.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_n.setStyleSheet("font-size:8.5pt; color:" + ("#1e8449" if subs_n else "#c0392b") + ";")
+
+        row_l.addWidget(cb, 1)
+        row_l.addWidget(lbl_n)
+        row_l.addWidget(btn_manage)
+        row_w.setLayout(row_l)
+
+        self.items_vbox.addWidget(row_w)
+        self.item_checkboxes[pkg_name] = cb
+        self.item_is_pkg[pkg_name] = 1
+        self.item_package_prices[pkg_name] = int(price or 0)
+
+    def manage_package(self, pkg_name):
+        """باز کردن زبانه پکیج: افزودن/حذف آیتم و تکمیل پکیج"""
+        dlg = PackageDetailsDialog(pkg_name, self)
+        accepted = (dlg.exec() == QDialog.DialogCode.Accepted)
+        final_name = getattr(dlg, "pkg_name", pkg_name) or pkg_name
+        checked = [n for n, cb in self.item_checkboxes.items()
+                   if self.item_is_pkg.get(n) and cb.isChecked()]
+        self.load_item_checkboxes()
+        self.load_staff_checkboxes()
+        if accepted:
+            cb = self.item_checkboxes.get(final_name)
+            if cb is not None and cb.isEnabled():
+                cb.setChecked(True)
+            else:
+                for n in checked:
+                    c2 = self.item_checkboxes.get(n)
+                    if c2 is not None and c2.isEnabled():
+                        c2.setChecked(True)
+        self.calc_wedding_total()
+
+    def _item_price(self, item_name):
+        """قیمت یک مورد در این قرارداد: برای خدمات از کادر، برای پکیج از انبار"""
+        w = self.item_price_inputs.get(item_name)
+        if w is not None:
+            return parse_number(w.text())
+        return int(self.item_package_prices.get(item_name, 0))
+
+    def package_snapshot(self, selected_items):
+        """
+        ریز آیتم‌های پکیج‌های انتخاب‌شده در همین لحظه ذخیره می‌شود تا
+        تغییرات بعدی انبار روی قراردادهای ثبت‌شده اثر نگذارد.
+        """
+        snap = {}
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            for it in selected_items:
+                cursor.execute("SELECT is_package FROM item_prices WHERE item_name=?", (it,))
+                r = cursor.fetchone()
+                if not (r and r[0] == 1):
+                    continue
+                cursor.execute("SELECT item_name, code, price FROM item_prices "
+                               "WHERE parent_package=? ORDER BY item_name", (it,))
+                snap[it] = [{"name": x[0], "code": x[1] or "", "price": int(x[2] or 0)}
+                            for x in cursor.fetchall()]
+            conn.close()
+        except Exception as e:
+            print("[PKG] snapshot error:", e)
+        return snap
 
     def load_staff_checkboxes(self):
         """بارگذاری افراد بخش کارکنان برای انتخاب در قرارداد"""
@@ -5871,10 +6461,13 @@ class StudioAccountingApp(QMainWindow):
 
         raw_sum = 0
         count_items = 0
+        count_pkg = 0
         for item_name, cb in self.item_checkboxes.items():
             if cb.isChecked():
                 count_items += 1
-                raw_sum += parse_number(self.item_price_inputs[item_name].text())
+                if self.item_is_pkg.get(item_name):
+                    count_pkg += 1
+                raw_sum += self._item_price(item_name)
 
         discount = parse_number(self.w_discount.text())
         deposit = parse_number(self.w_first_deposit.text())
@@ -5889,7 +6482,8 @@ class StudioAccountingApp(QMainWindow):
                 staff_total += parse_number(self.staff_wages[pid].text())
 
         self.w_lbl_total.setText(
-            f"<b>تعداد خدمات انتخاب‌شده:</b> {count_items} | "
+            f"<b>تعداد موارد انتخاب‌شده:</b> {count_items} "
+            f"(از این تعداد {count_pkg} پکیج) | "
             f"<b>جمع قیمت خام:</b> {raw_sum:,} تومان<br>"
             f"<b>تخفیف:</b> {discount:,} تومان | "
             f"<b>جمع کل بعد از تخفیف:</b> <span style='color:#2980b9;'>{net_total:,} تومان</span><br>"
@@ -5928,9 +6522,12 @@ class StudioAccountingApp(QMainWindow):
         items_detail = {}
         raw_total = 0
         for it in selected_items:
-            p = parse_number(self.item_price_inputs[it].text())
+            p = self._item_price(it)
             items_detail[it] = p
             raw_total += p
+        # ریز آیتم‌های پکیج‌ها همین حالا در قرارداد «قفل» می‌شود تا
+        # تغییرات بعدی انبار روی این قرارداد اثر نگذارد.
+        packages_detail = self.package_snapshot(selected_items)
 
         discount = parse_number(self.w_discount.text())
         net_total = max(0, raw_total - discount)
@@ -5964,14 +6561,16 @@ class StudioAccountingApp(QMainWindow):
             INSERT INTO wedding_contracts
             (code, groom_name, bride_name, groom_phone, bride_phone, contract_date,
              ceremony_date, selected_items, total_amount, discount, paid_amount,
-             bank_id, is_settled, description, work_year, items_detail, staff_ids, venue)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             bank_id, is_settled, description, work_year, items_detail, staff_ids, venue,
+             packages_detail)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (code, groom, bride, self.w_groom_phone.text(), self.w_bride_phone.text(),
               self.w_contract_date.text(), self.w_ceremony_date.text(),
               ",".join(selected_items), raw_total, discount, first_deposit,
               bank_id, is_settled, desc, work_year,
               json.dumps(items_detail, ensure_ascii=False),
-              json.dumps(staff_list, ensure_ascii=False), venue))
+              json.dumps(staff_list, ensure_ascii=False), venue,
+              json.dumps(packages_detail, ensure_ascii=False)))
 
         contract_id = cursor.lastrowid
         if first_deposit > 0:
@@ -7258,10 +7857,10 @@ class StudioAccountingApp(QMainWindow):
     # ============================================================
     def setup_reports_tab(self):
         layout = QVBoxLayout()
-        layout.setSpacing(8)
+        layout.setSpacing(7)
 
         top_layout = QHBoxLayout()
-        top_layout.setSpacing(7)
+        top_layout.setSpacing(6)
 
         self.combo_report_type = QComboBox()
         self.combo_report_type.addItems(["گزارش کل", "گزارش ماهانه", "گزارش سالانه", "گزارش هر فرد"])
@@ -7278,12 +7877,12 @@ class StudioAccountingApp(QMainWindow):
         btn_calc.clicked.connect(self.calculate_financial_report)
         top_layout.addWidget(btn_calc)
 
-        btn_print_rep = QPushButton(ico_text("print", "چاپ / PDF گزارش"))
+        btn_print_rep = QPushButton(ico_text("print", "چاپ / PDF"))
         btn_print_rep.setStyleSheet("background-color: #8e44ad; color: white; font-weight: bold; padding: 7px;")
         btn_print_rep.clicked.connect(self.print_financial_report)
         top_layout.addWidget(btn_print_rep)
 
-        btn_excel = QPushButton(ico_text("excel", "خروجی اکسل"))
+        btn_excel = QPushButton(ico_text("excel", "اکسل"))
         btn_excel.setStyleSheet("background-color: #1e8449; color: white; font-weight: bold; padding: 7px;")
         btn_excel.clicked.connect(lambda: self.export_table_excel(
             self.rep_table, "گزارش مالی جامع", f"گزارش_مالی_{get_current_year()}.xlsx"))
@@ -7295,33 +7894,42 @@ class StudioAccountingApp(QMainWindow):
         self.lbl_rep_summary.setWordWrap(True)
         self.lbl_rep_summary.setStyleSheet(
             "font-size: 11pt; font-weight: bold; background-color: #e8f8f5; "
-            "padding: 12px; border-radius: 8px; border: 1px solid #16a085;")
+            "padding: 10px; border-radius: 8px; border: 1px solid #16a085;")
         layout.addWidget(self.lbl_rep_summary)
 
         # ---------------- بخش نمودارها ----------------
-        chart_box = QGroupBox("نمودارهای گرافیکی (فارسی و راست‌چین)")
+        chart_box = QGroupBox("نمودارهای گرافیکی (فارسی و راست‌چین) — با دسته‌بندی ماهانه / فصلی / سالانه")
         chart_box.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
         ch = QHBoxLayout()
+        ch.setSpacing(6)
+
+        ch.addWidget(QLabel(f"{ico('calendar')} دسته‌بندی زمانی:"))
+        self.combo_chart_period = QComboBox()
+        self.combo_chart_period.addItems(["ماهانه", "فصلی", "سالانه"])
+        self.combo_chart_period.setToolTip("دوره‌بندی نمودارهای زمانی")
+        self.combo_chart_period.currentIndexChanged.connect(self.on_chart_period_changed)
+        ch.addWidget(self.combo_chart_period)
 
         self.combo_chart_kind = QComboBox()
         self.chart_kinds = [
-            ("نمودار درآمد و هزینه سال کاری", "income_expense"),
-            ("نمودار درآمد ماهانه (به تفکیک ماه شمسی)", "monthly_income"),
-            ("نمودار هزینه‌ها به تفکیک دسته‌بندی", "expense_categories"),
-            ("نمودار حقوق و پرداختی پرسنل", "staff_salaries"),
-            ("نمودار وضعیت موجودی انبار تجهیزات", "inventory_status"),
-            ("نمودار وضعیت چک‌های دریافتی و پرداختی", "checks_status"),
-            ("نمودار پلکانی درآمد ماهانه", "monthly_step"),
-            ("نمودار نقطه‌ای مبلغ مراسم", "scatter"),
+            ("نمودار درآمد و هزینه دوره", "income_expense"),
+            ("نمودار میله‌ای درآمد دوره", "monthly_income"),
+            ("نمودار پلکانی درآمد دوره", "monthly_step"),
             ("نمودار خطی روند درآمد و هزینه", "line_trend"),
-            ("نمودار دونات هزینه‌ها", "donut"),
             ("نمودار انباشته درآمد و هزینه", "stacked"),
             ("نمودار سطحی روند انباشته سود", "area"),
+            ("نمودار نقطه‌ای مبلغ مراسم", "scatter"),
+            ("نمودار دایره‌ای هزینه‌ها", "expense_categories"),
+            ("نمودار دونات هزینه‌ها", "donut"),
+            ("نمودار حقوق و پرداختی پرسنل", "staff_salaries"),
+            ("نمودار وضعیت موجودی انبار", "inventory_status"),
+            ("نمودار وضعیت چک‌های دریافتی و پرداختی", "checks_status"),
+            ("نمودار سود تجهیزات (نصف قیمت دوربین)", "equipment_profit"),
         ]
         for title, _key in self.chart_kinds:
             self.combo_chart_kind.addItem(f"{ico('chart')} {title}")
         ch.addWidget(QLabel("نوع نمودار:"))
-        ch.addWidget(self.combo_chart_kind, 3)
+        ch.addWidget(self.combo_chart_kind, 4)
 
         btn_chart = QPushButton(ico_text("chart", "نمایش نمودار"))
         btn_chart.setStyleSheet("background-color: #2980b9; color: white; font-weight: bold; padding: 7px;")
@@ -7343,6 +7951,13 @@ class StudioAccountingApp(QMainWindow):
 
         self.tab_reports.setLayout(layout)
         self.calculate_financial_report()
+
+    def on_chart_period_changed(self, _idx=None):
+        """با تغییر دسته‌بندی زمانی، برچسب نمودار انتخابی هم به‌روز می‌شود"""
+        try:
+            self.calculate_financial_report()
+        except Exception:
+            pass
 
     def load_report_persons_combo(self):
         if not hasattr(self, "combo_report_person_fin"):
@@ -7387,18 +8002,25 @@ class StudioAccountingApp(QMainWindow):
             return
         work_year = get_current_year()
         report_type = self.combo_report_type.currentText()
+        period = self.combo_chart_period.currentText() if hasattr(self, "combo_chart_period") else "ماهانه"
         t = self._report_totals()
 
         total_in = t["total_in"]
         total_out = t["total_out"]
         profit = total_in - total_out
+        eq_rows = equipment_profit_rows()
+        eq_each = sum(r["each"] for r in eq_rows)
+        eq_earned = sum(r["total"] for r in eq_rows)
 
         self.lbl_rep_summary.setText(
-            f"<b>سال کاری {work_year}</b>  |  "
-            f"ورودی کل: <b>{total_in:,}</b> تومان  |  "
-            f"خروجی کل: <b>{total_out:,}</b> تومان  |  "
+            f"<b>سال کاری {work_year}</b> | دسته‌بندی نمودارها: <b>{period}</b> | "
+            f"ورودی کل: <b>{total_in:,}</b> تومان | "
+            f"خروجی کل: <b>{total_out:,}</b> تومان | "
             f"سود خالص: <span style='color:{'#27ae60' if profit >= 0 else '#c0392b'};'>"
             f"<b>{profit:,}</b> تومان</span><br>"
+            f"{ico('camera')} <b>سود تجهیزات:</b> سود هر دوربین {eq_each:,} تومان | "
+            f"سود کسب‌شده {eq_earned:,} تومان | "
+            f"<b>سود کل با تجهیزات:</b> {profit + eq_earned:,} تومان<br>"
             f"<b>سود خالص به حروف:</b> {number_to_persian_words(abs(profit))} تومان "
             f"{'' if profit >= 0 else '(زیان)'}"
         )
@@ -7411,6 +8033,8 @@ class StudioAccountingApp(QMainWindow):
             ("پروژه‌های تبلیغاتی / بیوتی / تولدی", "درآمد (ورودی)", t["c_in"], "مجموع ورودی‌ها"),
             ("هزینه‌های جاری و قبوض", "هزینه (خروجی)", t["exp_out"], "مجموع هزینه‌ها"),
             ("حقوق و پرداختی پرسنل", "هزینه (خروجی)", t["staff_out"], "مجموع پرداختی‌ها"),
+            ("سود تجهیزات (نصف قیمت دوربین‌ها)", "سود تجهیزات", eq_earned,
+             f"جمع سود هر دوربین {eq_each:,} تومان"),
         ]
 
         person_id = self.combo_report_person_fin.currentData()
@@ -7429,8 +8053,8 @@ class StudioAccountingApp(QMainWindow):
                                "WHERE person_id=? AND work_year=?", (person_id, work_year))
                 total_person = cursor.fetchone()[0]
                 self.lbl_rep_summary.setText(
-                    f"<b>گزارش فردی:</b> {p[0]} ({p[1]})  |  "
-                    f"<b>جمع کل پرداختی:</b> {total_person:,} تومان  |  "
+                    f"<b>گزارش فردی:</b> {p[0]} ({p[1]}) | "
+                    f"<b>جمع کل پرداختی:</b> {total_person:,} تومان | "
                     f"<b>تعداد تراکنش:</b> {len(trans)}<br>"
                     f"<b>به حروف:</b> {number_to_persian_words(total_person)} تومان"
                 )
@@ -7448,6 +8072,8 @@ class StudioAccountingApp(QMainWindow):
             amount_item = QTableWidgetItem(f"{rec[2]:,}")
             if "خروجی" in str(rec[1]) or "کاهش" in str(rec[1]):
                 amount_item.setForeground(QColor("#c0392b"))
+            elif "تجهیزات" in str(rec[1]):
+                amount_item.setForeground(QColor("#0e6655"))
             else:
                 amount_item.setForeground(QColor("#1e8449"))
             self.rep_table.setItem(idx, 3, amount_item)
@@ -7458,11 +8084,9 @@ class StudioAccountingApp(QMainWindow):
     # ============================================================
     def _new_figure(self):
         setup_matplotlib_font()
-        fig = Figure(figsize=(9.0, 5.2), facecolor="#f8fbff")
-        return fig
+        return Figure(figsize=(9.0, 5.2), facecolor="#f8fbff")
 
     def _style_axes(self, ax, money_axis=None, grid_axis="y"):
-        """استایل مشترک نمودارها با محور پولی سه‌رقمی و راست‌چین"""
         ax.set_facecolor("#ffffff")
         for spine in ax.spines.values():
             spine.set_color("#c9d7e6")
@@ -7476,7 +8100,6 @@ class StudioAccountingApp(QMainWindow):
             ax.yaxis.set_major_formatter(comma)
 
     def _draw_barh(self, ax, labels, amounts, color, edge):
-        """نوار افقی راست‌چین همراه برچسب مبلغ بدون همپوشانی"""
         bars = ax.barh(labels, amounts, color=color, edgecolor=edge, linewidth=1.1, height=0.6)
         ax.yaxis.tick_right()
         self._style_axes(ax, money_axis="x", grid_axis="x")
@@ -7488,152 +8111,191 @@ class StudioAccountingApp(QMainWindow):
                     va="center", ha="left", fontsize=9, fontweight="bold", color="#2c3e50")
         return bars
 
+    def _series_by_period(self, period="ماهانه"):
+        """
+        درآمد و هزینه به تفکیک دوره:
+          ماهانه → ۱۲ ماه سال کاری جاری
+          فصلی  → ۴ فصل سال کاری جاری
+          سالانه → همه سال‌های کاری موجود
+        """
+        wy = get_current_year()
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            if period == "سالانه":
+                years = set()
+                for tbl in ("wedding_contracts", "commercial_projects", "expenses"):
+                    cursor.execute(f"SELECT DISTINCT work_year FROM {tbl} WHERE work_year IS NOT NULL")
+                    years |= {int(r[0]) for r in cursor.fetchall() if r[0]}
+                years = sorted(years) or [wy]
+                labels = [str(y) for y in years]
+                W = [0] * len(years)
+                C = [0] * len(years)
+                E = [0] * len(years)
+
+                def slot(_d, y):
+                    try:
+                        return years.index(int(y))
+                    except Exception:
+                        return None
+
+                cursor.execute("SELECT work_year, total_amount, discount FROM wedding_contracts")
+                for y, raw, disc in cursor.fetchall():
+                    i = slot(None, y)
+                    if i is not None:
+                        W[i] += max(0, (raw or 0) - (disc or 0))
+                cursor.execute("SELECT work_year, total_amount FROM commercial_projects")
+                for y, amt in cursor.fetchall():
+                    i = slot(None, y)
+                    if i is not None:
+                        C[i] += (amt or 0)
+                cursor.execute("SELECT work_year, amount FROM expenses")
+                for y, amt in cursor.fetchall():
+                    i = slot(None, y)
+                    if i is not None:
+                        E[i] += (amt or 0)
+            else:
+                if period == "فصلی":
+                    labels = [fa_shape(x) for x in ("بهار", "تابستان", "پاییز", "زمستان")]
+                    n = 4
+
+                    def slot(d):
+                        jd = parse_jalali(d)
+                        return ((jd.month - 1) // 3) if jd else None
+                else:
+                    labels = [fa_shape(jalali_month_name(m)) for m in range(1, 13)]
+                    n = 12
+
+                    def slot(d):
+                        jd = parse_jalali(d)
+                        return (jd.month - 1) if jd else None
+
+                W = [0] * n
+                C = [0] * n
+                E = [0] * n
+                cursor.execute("SELECT ceremony_date, total_amount, discount FROM wedding_contracts "
+                               "WHERE work_year=?", (wy,))
+                for d, raw, disc in cursor.fetchall():
+                    i = slot(d)
+                    if i is not None:
+                        W[i] += max(0, (raw or 0) - (disc or 0))
+                cursor.execute("SELECT project_date, total_amount FROM commercial_projects "
+                               "WHERE work_year=?", (wy,))
+                for d, amt in cursor.fetchall():
+                    i = slot(d)
+                    if i is not None:
+                        C[i] += (amt or 0)
+                cursor.execute("SELECT date_str, amount FROM expenses WHERE work_year=?", (wy,))
+                for d, amt in cursor.fetchall():
+                    i = slot(d)
+                    if i is not None:
+                        E[i] += (amt or 0)
+            conn.close()
+        except Exception as e:
+            print("[CHART] series error:", e)
+            return ["-"], [0], [0], [0]
+        return labels, W, C, E
+
+    def _chart_period(self):
+        if hasattr(self, "combo_chart_period"):
+            return self.combo_chart_period.currentText()
+        return "ماهانه"
+
     def build_chart(self, kind):
         """ساخت شکل نمودار بر اساس نوع انتخاب‌شده — با متن فارسی درست"""
         t = self._report_totals()
         wy = t["year"]
+        period = self._chart_period()
+        labels, W, C, E = self._series_by_period(period)
         fig = self._new_figure()
         ax = fig.add_subplot(111)
 
         if kind == "income_expense":
-            labels = [fa_shape("درآمد عروسی (بعد از تخفیف)"), fa_shape("درآمد تبلیغاتی"),
-                      fa_shape("هزینه‌ها"), fa_shape("حقوق پرسنل")]
-            amounts = [t["w_net"], t["c_in"], t["exp_out"], t["staff_out"]]
-            labels = labels[::-1]
-            amounts = amounts[::-1]
-            self._draw_barh(ax, labels, amounts,
+            names = [fa_shape("درآمد عروسی (بعد از تخفیف)"), fa_shape("درآمد تبلیغاتی"),
+                     fa_shape("هزینه‌ها"), fa_shape("حقوق پرسنل")]
+            amounts = [t["w_net"], t["c_in"], t["exp_out"], t["staff_out"]][::-1]
+            self._draw_barh(ax, names[::-1], amounts,
                             ["#8e44ad", "#c0392b", "#2980b9", "#27ae60"], "#2c3e50")
             ax.set_title(fa_shape(f"نمودار درآمد و هزینه - سال کاری {wy}"),
                          fontsize=13, fontweight="bold", pad=14, color="#1F4E78")
             ax.set_xlabel(fa_shape("مبلغ (تومان)"), fontsize=10, labelpad=6)
 
-        elif kind == "monthly_income":
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("SELECT ceremony_date FROM wedding_contracts "
-                           "WHERE work_year=? AND ceremony_date IS NOT NULL", (wy,))
-            dates = [r[0] for r in cursor.fetchall()]
-            cursor.execute("SELECT project_date FROM commercial_projects "
-                           "WHERE work_year=? AND project_date IS NOT NULL", (wy,))
-            dates += [r[0] for r in cursor.fetchall()]
-            conn.close()
-            buckets = {m: 0 for m in range(1, 13)}
-            for d in dates:
-                jd = parse_jalali(d)
-                if jd:
-                    buckets[jd.month] += 1
-            labels = [fa_shape(jalali_month_name(m)) for m in range(1, 13)][::-1]
-            counts = [buckets[m] for m in range(1, 13)][::-1]
-            bars = ax.bar(labels, counts, color="#2980b9", edgecolor="#1F4E78", linewidth=1.0)
-            for bar, cnt in zip(bars, counts):
-                if cnt:
-                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
-                            str(cnt), ha="center", va="bottom", fontsize=9, fontweight="bold")
-            ax.set_title(fa_shape(f"نمودار تعداد مراسم و پروژه‌ها به تفکیک ماه - سال {wy}"),
-                         fontsize=13, fontweight="bold", pad=14, color="#1F4E78")
-            ax.set_ylabel(fa_shape("تعداد"), fontsize=10)
-            self._style_axes(ax)
-            ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f"{int(x)}"))
-
-        elif kind == "expense_categories":
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("SELECT category, COALESCE(SUM(amount),0) FROM expenses "
-                           "WHERE work_year=? GROUP BY category ORDER BY 2 DESC", (wy,))
-            rows = cursor.fetchall()
-            conn.close()
-            if not rows:
-                labels = [fa_shape("هزینه‌ای ثبت نشده")]
-                amounts = [1]
-                colors = ["#dfe6e9"]
+        elif kind in ("monthly_income", "monthly_step"):
+            income = [W[i] + C[i] for i in range(len(labels))]
+            rev_labels = labels[::-1]
+            rev_income = income[::-1]
+            xs = list(range(len(rev_income)))
+            if kind == "monthly_income":
+                bars = ax.bar(rev_labels, rev_income, color="#2980b9",
+                              edgecolor="#1F4E78", linewidth=1.0)
+                for bar, cnt in zip(bars, rev_income):
+                    if cnt:
+                        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                                f"{int(cnt):,}", ha="center", va="bottom",
+                                fontsize=7.5, fontweight="bold", rotation=90)
             else:
-                labels = [fa_shape(r[0] or "-") for r in rows][::-1]
-                amounts = [r[1] for r in rows][::-1]
-                colors = plt.cm.Set3([i / max(1, len(rows) - 1) for i in range(len(rows))])[::-1]
-            wedges, _txt, _auto = ax.pie(
-                amounts, labels=None, autopct=lambda p: f"{p:.1f}%",
-                colors=colors, startangle=90, textprops={"fontsize": 9})
-            ax.legend(wedges, labels, loc="center right", bbox_to_anchor=(1.05, 0.5),
-                      fontsize=9, frameon=False)
-            ax.set_title(fa_shape(f"نمودار هزینه‌ها به تفکیک دسته‌بندی - سال {wy}"),
-                         fontsize=13, fontweight="bold", pad=14, color="#1F4E78")
-            ax.axis("equal")
-
-        elif kind == "staff_salaries":
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("""SELECT p.name, COALESCE(SUM(t.amount),0) AS s
-                              FROM transactions t JOIN persons p ON t.person_id=p.id
-                              WHERE t.work_year=? GROUP BY p.id ORDER BY s DESC LIMIT 15""", (wy,))
-            rows = cursor.fetchall()
-            conn.close()
-            if not rows:
-                labels, amounts = [fa_shape("پرداختی ثبت نشده")], [0]
-            else:
-                labels = [fa_shape(r[0]) for r in rows][::-1]
-                amounts = [r[1] for r in rows][::-1]
-            self._draw_barh(ax, labels, amounts, "#8e44ad", "#5b2c8e")
-            ax.set_title(fa_shape(f"نمودار حقوق و پرداختی پرسنل - سال {wy}"),
-                         fontsize=13, fontweight="bold", pad=14, color="#1F4E78")
-            ax.set_xlabel(fa_shape("مبلغ (تومان)"), fontsize=10, labelpad=6)
-
-        elif kind == "inventory_status":
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("SELECT item_name, total_count, used_count FROM inventory ORDER BY item_name")
-            rows = cursor.fetchall()
-            conn.close()
-            if not rows:
-                rows = [("انبار خالی", 0, 0)]
-            labels = [fa_shape(r[0]) for r in rows][::-1]
-            totals = [max(0, (r[1] or 0) - (r[2] or 0)) for r in rows][::-1]
-            used = [r[2] or 0 for r in rows][::-1]
-            idx = range(len(labels))
-            ax.barh(idx, totals, color="#27ae60", edgecolor="#1e8449", height=0.55, label=fa_shape("موجود"))
-            ax.barh(idx, used, left=totals, color="#e67e22", edgecolor="#b9600f",
-                    height=0.55, label=fa_shape("در استفاده"))
-            ax.set_yticks(list(idx))
-            ax.set_yticklabels(labels)
-            ax.yaxis.tick_right()
-            self._style_axes(ax, grid_axis="x")
-            ax.legend(fontsize=9, frameon=False, loc="lower right", bbox_to_anchor=(1.0, -0.18), ncol=2)
-            ax.set_title(fa_shape("نمودار وضعیت موجودی انبار تجهیزات"),
-                         fontsize=13, fontweight="bold", pad=14, color="#1F4E78")
-            ax.set_xlabel(fa_shape("تعداد"), fontsize=10)
-
-        elif kind == "checks_status":
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("SELECT COALESCE(check_type,'دریافتی'), COALESCE(SUM(amount),0), COUNT(*) "
-                           "FROM checks WHERE work_year=? GROUP BY check_type", (wy,))
-            rows = cursor.fetchall()
-            conn.close()
-            if not rows:
-                labels, amounts = [fa_shape("چکی ثبت نشده")], [1]
-                colors = ["#dfe6e9"]
-            else:
-                labels = [fa_shape(r[0]) for r in rows]
-                amounts = [r[1] for r in rows]
-                colors = ["#27ae60" if "دریافتی" in r[0] else "#c0392b" for r in rows]
-            ax.pie(amounts, labels=labels, autopct=lambda p: f"{p:.1f}%", colors=colors,
-                   startangle=90, textprops={"fontsize": 10})
-            ax.set_title(fa_shape(f"نمودار وضعیت چک‌های دریافتی و پرداختی - سال {wy}"),
-                         fontsize=13, fontweight="bold", pad=14, color="#1F4E78")
-            ax.axis("equal")
-
-        elif kind == "monthly_step":
-            wedding, comm, exp = self._monthly_series()
-            months = [fa_shape(jalali_month_name(m)) for m in range(1, 13)][::-1]
-            values = [(wedding[m] + comm[m]) for m in range(1, 13)][::-1]
-            xs = list(range(len(values)))
-            ax.step(xs, values, where="mid", color="#2980b9", linewidth=2.4)
-            ax.fill_between(xs, values, step="mid", color="#2980b9", alpha=0.16)
-            ax.set_xticks(xs)
-            ax.set_xticklabels(months, fontsize=8)
+                ax.step(xs, rev_income, where="mid", color="#2980b9", linewidth=2.4)
+                ax.fill_between(xs, rev_income, step="mid", color="#2980b9", alpha=0.16)
+                ax.set_xticks(xs)
+                ax.set_xticklabels(rev_labels, fontsize=8)
             self._style_axes(ax, money_axis="y")
-            ax.set_title(fa_shape(f"نمودار پلکانی درآمد ماهانه - سال {wy}"),
+            p_title = {"ماهانه": "ماهانه", "فصلی": "فصلی", "سالانه": "سالانه"}.get(period, "")
+            ax.set_title(fa_shape(f"نمودار درآمد {p_title} - سال کاری {wy}"),
                          fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
             ax.set_ylabel(fa_shape("مبلغ (تومان)"), fontsize=10)
+
+        elif kind == "line_trend":
+            income = [W[i] + C[i] for i in range(len(labels))][::-1]
+            costs = list(E)[::-1]
+            xs = list(range(len(income)))
+            ax.plot(xs, income, marker="o", linewidth=2.2, color="#1e8449",
+                    label=fa_shape("درآمد"))
+            ax.plot(xs, costs, marker="s", linewidth=2.2, color="#c0392b",
+                    label=fa_shape("هزینه"))
+            ax.set_xticks(xs)
+            ax.set_xticklabels(labels[::-1], fontsize=8)
+            self._style_axes(ax, money_axis="y")
+            ax.legend(fontsize=9, frameon=False, loc="upper right")
+            ax.set_title(fa_shape(f"نمودار خطی روند درآمد و هزینه ({period}) - سال {wy}"),
+                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
+            ax.set_ylabel(fa_shape("مبلغ (تومان)"), fontsize=10)
+
+        elif kind == "stacked":
+            rev_labels = labels[::-1]
+            xs = list(range(len(rev_labels)))
+            w_vals = list(W)[::-1]
+            c_vals = list(C)[::-1]
+            e_vals = list(E)[::-1]
+            ax.bar(xs, w_vals, color="#27ae60", edgecolor="#1e8449", width=0.62,
+                   label=fa_shape("درآمد عروسی"))
+            ax.bar(xs, c_vals, bottom=w_vals, color="#2980b9", edgecolor="#1F4E78",
+                   width=0.62, label=fa_shape("درآمد تبلیغاتی"))
+            ax.bar(xs, e_vals, color="#c0392b", edgecolor="#a93226", width=0.32,
+                   label=fa_shape("هزینه‌ها"))
+            ax.set_xticks(xs)
+            ax.set_xticklabels(rev_labels, fontsize=8)
+            self._style_axes(ax, money_axis="y")
+            ax.legend(fontsize=8.5, frameon=False, ncol=3)
+            ax.set_title(fa_shape(f"نمودار انباشته درآمد و هزینه ({period}) - سال {wy}"),
+                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
+            ax.set_ylabel(fa_shape("مبلغ (تومان)"), fontsize=10)
+
+        elif kind == "area":
+            profit = [(W[i] + C[i] - E[i]) for i in range(len(labels))][::-1]
+            xs = list(range(len(profit)))
+            cum, run = [], 0
+            for p_ in profit:
+                run += p_
+                cum.append(run)
+            ax.fill_between(xs, cum, color="#16a085", alpha=0.35)
+            ax.plot(xs, cum, color="#0e6655", linewidth=2.4, marker="o", markersize=4)
+            ax.axhline(0, color="#7f8c8d", linewidth=1, linestyle="--")
+            ax.set_xticks(xs)
+            ax.set_xticklabels(labels[::-1], fontsize=8)
+            self._style_axes(ax, money_axis="y")
+            ax.set_title(fa_shape(f"نمودار سطحی روند انباشته سود ({period}) - سال {wy}"),
+                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
+            ax.set_ylabel(fa_shape("سود انباشته (تومان)"), fontsize=10)
 
         elif kind == "scatter":
             conn = sqlite3.connect(DB_NAME)
@@ -7656,25 +8318,7 @@ class StudioAccountingApp(QMainWindow):
                          fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
             ax.set_ylabel(fa_shape("مبلغ قرارداد (تومان)"), fontsize=10)
 
-        elif kind == "line_trend":
-            wedding, comm, exp = self._monthly_series()
-            months = [fa_shape(jalali_month_name(m)) for m in range(1, 13)][::-1]
-            income = [(wedding[m] + comm[m]) for m in range(1, 13)][::-1]
-            costs = [exp[m] for m in range(1, 13)][::-1]
-            xs = list(range(len(months)))
-            ax.plot(xs, income, marker="o", linewidth=2.2, color="#1e8449",
-                    label=fa_shape("درآمد"))
-            ax.plot(xs, costs, marker="s", linewidth=2.2, color="#c0392b",
-                    label=fa_shape("هزینه"))
-            ax.set_xticks(xs)
-            ax.set_xticklabels(months, fontsize=8)
-            self._style_axes(ax, money_axis="y")
-            ax.legend(fontsize=9, frameon=False)
-            ax.set_title(fa_shape(f"نمودار خطی روند درآمد و هزینه - سال {wy}"),
-                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
-            ax.set_ylabel(fa_shape("مبلغ (تومان)"), fontsize=10)
-
-        elif kind == "donut":
+        elif kind in ("expense_categories", "donut"):
             conn = sqlite3.connect(DB_NAME)
             cursor = conn.cursor()
             cursor.execute("SELECT category, COALESCE(SUM(amount),0) FROM expenses "
@@ -7682,106 +8326,144 @@ class StudioAccountingApp(QMainWindow):
             rows = cursor.fetchall()
             conn.close()
             if not rows:
-                labels, amounts = [fa_shape("هزینه‌ای ثبت نشده")], [1]
+                p_labels, amounts = [fa_shape("هزینه‌ای ثبت نشده")], [1]
                 colors = ["#dfe6e9"]
             else:
-                labels = [fa_shape(r[0] or "-") for r in rows]
+                p_labels = [fa_shape(r[0] or "-") for r in rows]
                 amounts = [r[1] for r in rows]
                 colors = list(plt.cm.Pastel1(range(len(rows))))
-            wedges, _t, _a = ax.pie(amounts, labels=None, autopct=lambda p: f"{p:.1f}%",
-                                    colors=colors, startangle=90,
-                                    wedgeprops=dict(width=0.42, edgecolor="white"),
-                                    textprops={"fontsize": 8.5})
-            ax.legend(wedges, labels, loc="center right", bbox_to_anchor=(1.12, 0.5),
+            if kind == "donut":
+                wedges, _t, _a = ax.pie(
+                    amounts, labels=None, autopct=lambda p: f"{p:.1f}%", colors=colors,
+                    startangle=90, wedgeprops=dict(width=0.42, edgecolor="white"),
+                    textprops={"fontsize": 8.5})
+                ax.set_title(fa_shape(f"نمودار دونات هزینه‌ها به تفکیک دسته - سال {wy}"),
+                             fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
+            else:
+                wedges, _t, _a = ax.pie(amounts, labels=None,
+                                        autopct=lambda p: f"{p:.1f}%", colors=colors,
+                                        startangle=90, textprops={"fontsize": 9})
+                ax.set_title(fa_shape(f"نمودار دایره‌ای هزینه‌ها به تفکیک دسته - سال {wy}"),
+                             fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
+            ax.legend(wedges, p_labels, loc="center right", bbox_to_anchor=(1.12, 0.5),
                       fontsize=8.5, frameon=False)
-            ax.set_title(fa_shape(f"نمودار دونات هزینه‌ها به تفکیک دسته - سال {wy}"),
+            ax.axis("equal")
+
+        elif kind == "staff_salaries":
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("""SELECT p.name, COALESCE(SUM(t.amount),0) AS s
+                              FROM transactions t JOIN persons p ON t.person_id=p.id
+                              WHERE t.work_year=? GROUP BY p.id ORDER BY s DESC LIMIT 15""", (wy,))
+            rows = cursor.fetchall()
+            conn.close()
+            if not rows:
+                p_labels, amounts = [fa_shape("پرداختی ثبت نشده")], [0]
+            else:
+                p_labels = [fa_shape(r[0]) for r in rows][::-1]
+                amounts = [r[1] for r in rows][::-1]
+            self._draw_barh(ax, p_labels, amounts, "#8e44ad", "#5b2c8e")
+            ax.set_title(fa_shape(f"نمودار حقوق و پرداختی پرسنل - سال {wy}"),
+                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
+            ax.set_xlabel(fa_shape("مبلغ (تومان)"), fontsize=10, labelpad=6)
+
+        elif kind == "inventory_status":
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("SELECT item_name, total_count, used_count FROM inventory ORDER BY item_name")
+            rows = cursor.fetchall()
+            conn.close()
+            if not rows:
+                rows = [("انبار خالی", 0, 0)]
+            p_labels = [fa_shape(r[0]) for r in rows][::-1]
+            totals = [max(0, (r[1] or 0) - (r[2] or 0)) for r in rows][::-1]
+            used = [r[2] or 0 for r in rows][::-1]
+            idx = range(len(p_labels))
+            ax.barh(idx, totals, color="#27ae60", edgecolor="#1e8449", height=0.55,
+                    label=fa_shape("موجود"))
+            ax.barh(idx, used, left=totals, color="#e67e22", edgecolor="#b9600f",
+                    height=0.55, label=fa_shape("در استفاده"))
+            ax.set_yticks(list(idx))
+            ax.set_yticklabels(p_labels)
+            ax.yaxis.tick_right()
+            self._style_axes(ax, grid_axis="x")
+            ax.legend(fontsize=9, frameon=False, loc="lower right", bbox_to_anchor=(1.0, -0.18), ncol=2)
+            ax.set_title(fa_shape("نمودار وضعیت موجودی انبار تجهیزات"),
+                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
+            ax.set_xlabel(fa_shape("تعداد"), fontsize=10)
+
+        elif kind == "checks_status":
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COALESCE(check_type,'دریافتی'), COALESCE(SUM(amount),0), COUNT(*) "
+                           "FROM checks WHERE work_year=? GROUP BY check_type", (wy,))
+            rows = cursor.fetchall()
+            conn.close()
+            if not rows:
+                p_labels, amounts = [fa_shape("چکی ثبت نشده")], [1]
+                colors = ["#dfe6e9"]
+            else:
+                p_labels = [fa_shape(r[0]) for r in rows]
+                amounts = [r[1] for r in rows]
+                colors = ["#27ae60" if "دریافتی" in r[0] else "#c0392b" for r in rows]
+            ax.pie(amounts, labels=p_labels, autopct=lambda p: f"{p:.1f}%", colors=colors,
+                   startangle=90, textprops={"fontsize": 10})
+            ax.set_title(fa_shape(f"نمودار وضعیت چک‌های دریافتی و پرداختی - سال {wy}"),
                          fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
             ax.axis("equal")
 
-        elif kind == "stacked":
-            wedding, comm, exp = self._monthly_series()
-            months = [fa_shape(jalali_month_name(m)) for m in range(1, 13)][::-1]
-            xs = list(range(len(months)))
-            w_vals = [wedding[m] for m in range(1, 13)][::-1]
-            c_vals = [comm[m] for m in range(1, 13)][::-1]
-            e_vals = [exp[m] for m in range(1, 13)][::-1]
-            ax.bar(xs, w_vals, color="#27ae60", edgecolor="#1e8449", width=0.62,
-                   label=fa_shape("درآمد عروسی"))
-            ax.bar(xs, c_vals, bottom=w_vals, color="#2980b9", edgecolor="#1F4E78",
-                   width=0.62, label=fa_shape("درآمد تبلیغاتی"))
-            ax.bar(xs, e_vals, color="#c0392b", edgecolor="#a93226", width=0.32,
-                   label=fa_shape("هزینه‌ها"))
-            ax.set_xticks(xs)
-            ax.set_xticklabels(months, fontsize=8)
-            self._style_axes(ax, money_axis="y")
-            ax.legend(fontsize=8.5, frameon=False, ncol=3)
-            ax.set_title(fa_shape(f"نمودار انباشته درآمد و هزینه ماهانه - سال {wy}"),
-                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
-            ax.set_ylabel(fa_shape("مبلغ (تومان)"), fontsize=10)
-
-        elif kind == "area":
-            wedding, comm, exp = self._monthly_series()
-            months = [fa_shape(jalali_month_name(m)) for m in range(1, 13)][::-1]
-            xs = list(range(len(months)))
-            profit = [(wedding[m] + comm[m] - exp[m]) for m in range(1, 13)][::-1]
-            cum = []
-            run = 0
-            for p_ in profit:
-                run += p_
-                cum.append(run)
-            ax.fill_between(xs, cum, color="#16a085", alpha=0.35)
-            ax.plot(xs, cum, color="#0e6655", linewidth=2.4, marker="o", markersize=4)
-            ax.axhline(0, color="#7f8c8d", linewidth=1, linestyle="--")
-            ax.set_xticks(xs)
-            ax.set_xticklabels(months, fontsize=8)
-            self._style_axes(ax, money_axis="y")
-            ax.set_title(fa_shape(f"نمودار سطحی روند انباشته سود - سال {wy}"),
-                         fontsize=12.5, fontweight="bold", pad=12, color="#1F4E78")
-            ax.set_ylabel(fa_shape("سود انباشته (تومان)"), fontsize=10)
+        elif kind == "equipment_profit":
+            rows = equipment_profit_rows()
+            if not rows:
+                p_labels, amounts = [fa_shape("دوربینی ثبت نشده")], [0]
+                earned = []
+            else:
+                p_labels = [fa_shape(r["name"]) for r in rows][::-1]
+                amounts = [r["each"] for r in rows][::-1]
+                earned = [r["total"] for r in rows][::-1]
+            bars = ax.barh(p_labels, amounts, color="#16a085", edgecolor="#0e6655",
+                           height=0.6, label=fa_shape("سود هر دوربین (نصف قیمت)"))
+            ax.yaxis.tick_right()
+            self._style_axes(ax, money_axis="x", grid_axis="x")
+            maxv = max(amounts + [1])
+            ax.set_xlim(0, maxv * 1.35)
+            for bar, amt, ern in zip(bars, amounts, earned):
+                txt = f"{amt:,}" + (f"  (کسب‌شده: {ern:,})" if ern else "")
+                ax.text(bar.get_width() + maxv * 0.02,
+                        bar.get_y() + bar.get_height() / 2, txt,
+                        va="center", ha="left", fontsize=8.5, fontweight="bold", color="#0e6655")
+            total_each = sum(amounts)
+            total_earned = sum(earned)
+            ax.set_title(fa_shape(f"نمودار سود تجهیزات - سود هر دوربین {total_each:,} تومان"
+                                  f" | سود کسب‌شده {total_earned:,} تومان"),
+                         fontsize=11.5, fontweight="bold", pad=12, color="#1F4E78")
+            ax.set_xlabel(fa_shape("سود (تومان)"), fontsize=10, labelpad=6)
+            ax.legend(fontsize=9, frameon=False, loc="lower right")
 
         fig.tight_layout()
         return fig
 
-    def _monthly_series(self):
-        """درآمد عروسی، درآمد تبلیغاتی و هزینه‌ها به تفکیک ماه شمسی"""
-        wy = get_current_year()
-        wedding = [0] * 13
-        comm = [0] * 13
-        exp = [0] * 13
+    def show_named_chart(self, kind):
+        """نمایش یک نمودار مشخص با کلید آن (از هر جای برنامه)"""
+        titles = {}
+        if hasattr(self, "chart_kinds"):
+            titles = {k: t for t, k in self.chart_kinds}
+        title = titles.get(kind, "نمودار")
         try:
-            conn = sqlite3.connect(DB_NAME)
-            cursor = conn.cursor()
-            cursor.execute("SELECT ceremony_date, total_amount, discount FROM wedding_contracts "
-                           "WHERE work_year=?", (wy,))
-            for d, raw, disc in cursor.fetchall():
-                jd = parse_jalali(d)
-                if jd and 1 <= jd.month <= 12:
-                    wedding[jd.month] += max(0, (raw or 0) - (disc or 0))
-            cursor.execute("SELECT project_date, total_amount FROM commercial_projects "
-                           "WHERE work_year=?", (wy,))
-            for d, amt in cursor.fetchall():
-                jd = parse_jalali(d)
-                if jd and 1 <= jd.month <= 12:
-                    comm[jd.month] += (amt or 0)
-            cursor.execute("SELECT date_str, amount FROM expenses WHERE work_year=?", (wy,))
-            for d, amt in cursor.fetchall():
-                jd = parse_jalali(d)
-                if jd and 1 <= jd.month <= 12:
-                    exp[jd.month] += (amt or 0)
-            conn.close()
+            fig = self.build_chart(kind)
+            ChartDialog(fig, f"{title} - {self._chart_period()}", self).exec()
         except Exception as e:
-            print("[CHART] monthly series error:", e)
-        return wedding, comm, exp
-
+            QMessageBox.critical(self, "خطا در نمودار", f"ساخت نمودار ناموفق بود:\n{e}")
 
     def show_financial_chart(self):
-        """نمایش نمودار انتخابی با عنوان فارسی درست (رفع برعکس و جدا بودن حروف)"""
+        """نمایش نمودار انتخابی با عنوان فارسی درست"""
         try:
             idx = self.combo_chart_kind.currentIndex()
             if idx < 0:
                 idx = 0
             title, kind = self.chart_kinds[idx]
-            title = f"{title} - سال {get_current_year()}"
+            period = self._chart_period()
+            title = f"{title} - {period} - سال {get_current_year()}"
             fig = self.build_chart(kind)
             dlg = ChartDialog(fig, title, self)
             dlg.exec()
@@ -8210,14 +8892,14 @@ class StudioAccountingApp(QMainWindow):
     # ============================================================
     def setup_inventory_tab(self):
         layout = QVBoxLayout()
-        layout.setSpacing(8)
+        layout.setSpacing(7)
 
-        # ==================== افزودن تجهیز جدید ====================
-        add_box = QGroupBox("افزودن تجهیز / کالای جدید (هماهنگ با فاکتور و قراردادها)")
+        # ==================== افزودن کالا / خدمات جدید ====================
+        add_box = QGroupBox("افزودن کالا یا خدمات جدید (مرجع اصلی نام و قیمت در کل برنامه)")
         add_box.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
         add_layout = QGridLayout()
         add_layout.setHorizontalSpacing(9)
-        add_layout.setVerticalSpacing(7)
+        add_layout.setVerticalSpacing(6)
 
         self.inv_name = QLineEdit()
         self.inv_code = QLineEdit()
@@ -8229,10 +8911,13 @@ class StudioAccountingApp(QMainWindow):
         self.inv_total.setValue(1)
         self.inv_price = QLineEdit()
         self.inv_price.textChanged.connect(lambda t: self.inv_price.setText(format_number(t)))
+        self.inv_price.textChanged.connect(self.update_inv_profit_hint)
         self.inv_note = QLineEdit()
         self.inv_note.setPlaceholderText("سریال، مدل، مشخصات فنی...")
+        self.inv_is_camera = QCheckBox("این مورد دوربین است (سود = نصف قیمت)")
+        self.inv_is_camera.stateChanged.connect(self.update_inv_profit_hint)
 
-        add_layout.addWidget(QLabel(f"{ico('inventory')} نام تجهیز:"), 0, 0)
+        add_layout.addWidget(QLabel(f"{ico('inventory')} نام کالا یا خدمات:"), 0, 0)
         add_layout.addWidget(self.inv_name, 0, 1)
         add_layout.addWidget(QLabel("کد (یکتا):"), 0, 2)
         add_layout.addWidget(self.inv_code, 0, 3)
@@ -8246,68 +8931,164 @@ class StudioAccountingApp(QMainWindow):
         add_layout.addWidget(QLabel("مشخصات:"), 1, 4)
         add_layout.addWidget(self.inv_note, 1, 5)
 
-        btn_add = QPushButton(ico_text("add", "افزودن به انبار و فاکتور"))
+        add_layout.addWidget(self.inv_is_camera, 2, 0, 1, 2)
+        self.lbl_inv_profit = QLabel("")
+        self.lbl_inv_profit.setStyleSheet("background-color:#eafaf1; border:1px solid #27ae60; "
+                                          "border-radius:6px; padding:5px; font-size:9pt;")
+        add_layout.addWidget(self.lbl_inv_profit, 2, 2, 1, 4)
+
+        btn_add = QPushButton(ico_text("add", "افزودن به انبار و فهرست خدمات"))
         btn_add.setStyleSheet("background-color:#27ae60; color:white; font-weight:bold; padding:9px;")
         btn_add.clicked.connect(self.add_inventory_item)
-        add_layout.addWidget(btn_add, 2, 0, 1, 6)
+        add_layout.addWidget(btn_add, 3, 0, 1, 6)
 
         add_box.setLayout(add_layout)
         layout.addWidget(add_box)
 
-        # ==================== نوار ابزار انبار ====================
+        # ==================== نوار ابزار ====================
         top = QHBoxLayout()
         btn_refresh = QPushButton(ico_text("refresh", "بروزرسانی"))
-        btn_refresh.setStyleSheet("background-color: #3498db; color: white; font-weight: bold; padding: 7px;")
+        btn_refresh.setStyleSheet("background-color: #3498db; color: white; font-weight: bold; padding: 6px;")
         btn_refresh.clicked.connect(self.load_inventory)
 
         btn_save = QPushButton(ico_text("save", "ثبت تغییرات انبار"))
-        btn_save.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 7px;")
-        btn_save.setToolTip("تعدادهای جدید را در همه بخش‌ها (انبار، قرارداد و فاکتور) اعمال می‌کند")
+        btn_save.setStyleSheet("background-color: #27ae60; color: white; font-weight: bold; padding: 6px;")
+        btn_save.setToolTip("تعدادهای جدید را در همه بخش‌ها اعمال می‌کند")
         btn_save.clicked.connect(self.save_inventory_changes)
 
-        btn_recalc = QPushButton(ico_text("calc", "بازمحاسبه مصرف از قراردادها"))
-        btn_recalc.setStyleSheet("background-color: #e67e22; color: white; font-weight: bold; padding: 7px;")
-        btn_recalc.setToolTip("«استفاده شده» هر قلم را از روی قراردادهای واقعی دوباره حساب می‌کند")
+        btn_recalc = QPushButton(ico_text("calc", "بازمحاسبه مصرف"))
+        btn_recalc.setStyleSheet("background-color: #e67e22; color: white; font-weight: bold; padding: 6px;")
         btn_recalc.clicked.connect(self.recalc_inventory_click)
 
-        btn_print = QPushButton(ico_text("print", "چاپ / PDF لیست انبار"))
-        btn_print.setStyleSheet("background-color: #2980b9; color: white; font-weight: bold; padding: 7px;")
+        btn_manage = QPushButton(ico_text("edit", "مدیریت کالاها و پکیج‌ها"))
+        btn_manage.setStyleSheet("background-color: #8e44ad; color: white; font-weight: bold; padding: 6px;")
+        btn_manage.setToolTip("ویرایش نام، قیمت، پکیج‌ها و زیرمجموعه‌ها")
+        btn_manage.clicked.connect(self.open_manage_items)
+
+        btn_print = QPushButton(ico_text("print", "چاپ / PDF"))
+        btn_print.setStyleSheet("background-color: #2980b9; color: white; font-weight: bold; padding: 6px;")
         btn_print.clicked.connect(self.print_inventory)
 
         btn_excel = QPushButton(ico_text("excel", "خروجی اکسل"))
-        btn_excel.setStyleSheet("background-color: #1e8449; color: white; font-weight: bold; padding: 7px;")
+        btn_excel.setStyleSheet("background-color: #1e8449; color: white; font-weight: bold; padding: 6px;")
         btn_excel.clicked.connect(lambda: self.export_table_excel(
             self.inv_table, "انبار تجهیزات", "انبار_تجهیزات.xlsx"))
 
-        top.addWidget(btn_refresh)
-        top.addWidget(btn_save)
-        top.addWidget(btn_recalc)
-        top.addWidget(btn_print)
-        top.addWidget(btn_excel)
+        for b in (btn_refresh, btn_save, btn_recalc, btn_manage, btn_print, btn_excel):
+            top.addWidget(b)
         top.addStretch()
         layout.addLayout(top)
 
         self.lbl_inv_summary = QLabel("")
         self.lbl_inv_summary.setWordWrap(True)
         self.lbl_inv_summary.setStyleSheet("background-color:#eaf6ff; border:1px solid #a9d3ee; "
-                                           "border-radius:8px; padding:9px; font-size:10pt;")
+                                           "border-radius:7px; padding:7px; font-size:9.5pt;")
         layout.addWidget(self.lbl_inv_summary)
 
+        # ==================== جدول انبار + سود تجهیزات (قابل تغییر اندازه) ====================
         self.inv_table = QTableWidget()
         self.inv_table.setColumnCount(9)
         self.inv_table.setHorizontalHeaderLabels([
-            "کد کالا", "نام آیتم / پکیج", "دسته‌بندی", "تعداد کل (قابل ویرایش)",
+            "کد کالا", "نام کالا یا خدمات", "دسته‌بندی", "تعداد کل (قابل ویرایش)",
             "استفاده شده", "موجودی", "قیمت واحد (تومان)", "مشخصات", "حذف"
         ])
         self.inv_table.setAlternatingRowColors(True)
         self.inv_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         persist_table(self.inv_table, "inventory", QHeaderView.ResizeMode.ResizeToContents)
-        self.inv_table.verticalHeader().setDefaultSectionSize(36)
-        layout.addWidget(self.inv_table, 1)
+        self.inv_table.verticalHeader().setDefaultSectionSize(34)
+        self.inv_table.setMinimumHeight(120)
+
+        # --- بخش سود تجهیزات ---
+        profit_box = QGroupBox("سود تجهیزات (هر دوربین = نصف قیمت ثبت‌شده در انبار)")
+        profit_box.setFont(QFont(APP_FONT_FAMILY, 10, QFont.Weight.Bold))
+        pv = QVBoxLayout()
+        pv.setSpacing(5)
+
+        ptop = QHBoxLayout()
+        self.lbl_profit_sum = QLabel("")
+        self.lbl_profit_sum.setWordWrap(True)
+        self.lbl_profit_sum.setStyleSheet("background-color:#eafaf1; border:1px solid #27ae60; "
+                                          "border-radius:7px; padding:7px; font-size:9.5pt;")
+        btn_profit_chart = QPushButton(ico_text("chart", "نمودار سود تجهیزات"))
+        btn_profit_chart.setStyleSheet("background-color:#2980b9; color:white; font-weight:bold; padding:7px;")
+        btn_profit_chart.clicked.connect(lambda: self.show_named_chart("equipment_profit"))
+        ptop.addWidget(self.lbl_profit_sum, 3)
+        ptop.addWidget(btn_profit_chart, 1)
+        pv.addLayout(ptop)
+
+        self.profit_table = QTableWidget()
+        self.profit_table.setColumnCount(6)
+        self.profit_table.setHorizontalHeaderLabels([
+            "نام کالا", "کد", "قیمت ثبت‌شده", "سود هر دوربین (نصف)",
+            "تعداد استفاده", "سود کسب‌شده"
+        ])
+        self.profit_table.setAlternatingRowColors(True)
+        self.profit_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        persist_table(self.profit_table, "equipment_profit", QHeaderView.ResizeMode.Stretch)
+        self.profit_table.verticalHeader().setDefaultSectionSize(30)
+        self.profit_table.setMinimumHeight(80)
+        pv.addWidget(self.profit_table)
+        profit_box.setLayout(pv)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self.inv_table)
+        splitter.addWidget(profit_box)
+        splitter.setSizes([420, 240])
+        persist_splitter(splitter, "tab_inventory")
+        layout.addWidget(splitter, 1)
 
         self.tab_inventory.setLayout(layout)
         self.inv_spins = {}
         self.load_inventory()
+        self.load_equipment_profit()
+
+    def update_inv_profit_hint(self, *args):
+        if not hasattr(self, "lbl_inv_profit"):
+            return
+        price = parse_number(self.inv_price.text())
+        if self.inv_is_camera.isChecked():
+            self.lbl_inv_profit.setText(
+                f"{ico('money')} سود هر دوربین (نصف قیمت): <b>{price // 2:,}</b> تومان "
+                f"از قیمت {price:,} تومان")
+        else:
+            self.lbl_inv_profit.setText(
+                f"{ico('detail')} برای محاسبه سود، اگر این قلم دوربین است تیک بزنید.")
+
+    def load_equipment_profit(self):
+        """پر کردن جدول سود تجهیزات"""
+        if not hasattr(self, "profit_table"):
+            return
+        rows = equipment_profit_rows()
+        self.profit_table.setRowCount(0)
+        total_price = total_each = total_earned = 0
+        for r_idx, r in enumerate(rows):
+            total_price += r["price"]
+            total_each += r["each"]
+            total_earned += r["total"]
+            self.profit_table.insertRow(r_idx)
+            self.profit_table.setItem(r_idx, 0, QTableWidgetItem(r["name"]))
+            self.profit_table.setItem(r_idx, 1, QTableWidgetItem(r["code"]))
+            self.profit_table.setItem(r_idx, 2, QTableWidgetItem(f"{r['price']:,}"))
+            each_item = QTableWidgetItem(f"{r['each']:,}")
+            each_item.setForeground(QColor("#1e8449"))
+            f = each_item.font(); f.setBold(True); each_item.setFont(f)
+            self.profit_table.setItem(r_idx, 3, each_item)
+            self.profit_table.setItem(r_idx, 4, QTableWidgetItem(str(r["used"])))
+            earned = QTableWidgetItem(f"{r['total']:,}")
+            earned.setForeground(QColor("#0e6655"))
+            self.profit_table.setItem(r_idx, 5, earned)
+
+        if hasattr(self, "lbl_profit_sum"):
+            if rows:
+                self.lbl_profit_sum.setText(
+                    f"<b>تعداد دوربین‌ها:</b> {len(rows)} | "
+                    f"<b>جمع قیمت ثبت‌شده:</b> {total_price:,} تومان | "
+                    f"<b>جمع سود هر دوربین (نصف):</b> {total_each:,} تومان | "
+                    f"<b style='color:#0e6655;'>سود کسب‌شده (با تعداد استفاده):</b> {total_earned:,} تومان")
+            else:
+                self.lbl_profit_sum.setText(
+                    "هنوز هیچ قلمی به‌عنوان «دوربین» ثبت نشده است. در فرم بالا تیک "
+                    "«این مورد دوربین است» را بزنید تا سود آن (نصف قیمت) محاسبه شود.")
 
     def recalc_inventory_click(self):
         recalc_inventory_usage()
@@ -8318,12 +9099,13 @@ class StudioAccountingApp(QMainWindow):
         """افزودن تجهیز جدید با جزئیات، هماهنگ با انبار، قراردادها و فاکتور"""
         name = self.inv_name.text().strip()
         if not name:
-            QMessageBox.warning(self, "خطا", "لطفاً نام تجهیز را وارد کنید.")
+            QMessageBox.warning(self, "خطا", "لطفاً نام کالا یا خدمات را وارد کنید.")
             return
 
         code = self.inv_code.text().strip()
         if not code:
             code = generate_unique_code("EQP", "item_prices", "code", start=3001)
+        is_camera = 1 if self.inv_is_camera.isChecked() else 0
 
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -8336,11 +9118,12 @@ class StudioAccountingApp(QMainWindow):
             return
 
         cursor.execute('''
-            INSERT INTO item_prices (item_name, code, price, is_package, parent_package)
-            VALUES (?, ?, ?, 0, '')
+            INSERT INTO item_prices (item_name, code, price, is_package, parent_package, is_camera)
+            VALUES (?, ?, ?, 0, '', ?)
             ON CONFLICT(item_name) DO UPDATE SET
-                code=excluded.code, price=excluded.price
-        ''', (name, code, parse_number(self.inv_price.text())))
+                code=excluded.code, price=excluded.price,
+                is_camera=excluded.is_camera
+        ''', (name, code, parse_number(self.inv_price.text()), is_camera))
 
         cursor.execute('''
             INSERT INTO inventory (item_name, total_count, used_count, category, note)
@@ -8361,11 +9144,13 @@ class StudioAccountingApp(QMainWindow):
         self.inv_note.clear()
         self.inv_price.clear()
         self.inv_total.setValue(1)
+        self.inv_is_camera.setChecked(False)
 
         self.load_inventory()
+        self.load_equipment_profit()
         self.load_item_checkboxes()
         QMessageBox.information(self, "موفقیت",
-                                f"تجهیز «{name}» با کد {code} به انبار و فاکتور اضافه شد.")
+                                f"«{name}» با کد {code} به انبار و فهرست خدمات اضافه شد.")
 
     def load_inventory(self):
         if not hasattr(self, "inv_table"):
@@ -8373,7 +9158,7 @@ class StudioAccountingApp(QMainWindow):
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
         cursor.execute("""SELECT i.item_name, ip.code, i.total_count, i.used_count,
-                                 ip.price, i.category, i.note
+                                 ip.price, i.category, i.note, COALESCE(ip.is_camera,0)
                           FROM inventory i
                           LEFT JOIN item_prices ip ON i.item_name = ip.item_name
                           ORDER BY i.item_name""")
@@ -8387,7 +9172,7 @@ class StudioAccountingApp(QMainWindow):
         total_value = 0
         low_stock = []
 
-        for r_idx, (name, code, total, used, price, category, note) in enumerate(rows):
+        for r_idx, (name, code, total, used, price, category, note, is_cam) in enumerate(rows):
             total = total or 0
             used = used or 0
             remain = max(0, total - used)
@@ -8400,7 +9185,11 @@ class StudioAccountingApp(QMainWindow):
 
             self.inv_table.insertRow(r_idx)
             self.inv_table.setItem(r_idx, 0, QTableWidgetItem(code or "-"))
-            self.inv_table.setItem(r_idx, 1, QTableWidgetItem(name))
+            cam = ico("camera") + " " if is_cam else ""
+            name_item = QTableWidgetItem(cam + name)
+            if is_cam:
+                name_item.setToolTip(f"دوربین | سود هر واحد: {(price or 0) // 2:,} تومان")
+            self.inv_table.setItem(r_idx, 1, name_item)
             self.inv_table.setItem(r_idx, 2, QTableWidgetItem(category or "-"))
 
             spin = QSpinBox()
@@ -8432,6 +9221,7 @@ class StudioAccountingApp(QMainWindow):
             btn_del.clicked.connect(lambda _, n=name: self.delete_inventory_item(n))
             self.inv_table.setCellWidget(r_idx, 8, btn_del)
 
+        self.load_equipment_profit()
         self.lbl_inv_summary.setText(
             f"<b>تعداد اقلام:</b> {len(rows)}  |  "
             f"<b>جمع موجودی (تعداد):</b> {total_count_sum}  |  "
@@ -8478,6 +9268,7 @@ class StudioAccountingApp(QMainWindow):
         conn.close()
         recalc_inventory_usage()
         self.load_inventory()
+        self.load_equipment_profit()
         self.load_item_checkboxes()
         QMessageBox.information(self, "موفقیت",
                                 f"تعداد کل {changed} قلم انبار به‌روزرسانی شد و "
@@ -8500,6 +9291,7 @@ class StudioAccountingApp(QMainWindow):
         conn.close()
         recalc_inventory_usage()
         self.load_inventory()
+        self.load_equipment_profit()
         self.load_item_checkboxes()
 
     def inventory_html(self, mono=False):
