@@ -18,7 +18,8 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox, QRadioButton, QButtonGroup, QSplitter, QLayout
 )
 from PyQt6.QtCore import (Qt, QDate, QTimer, QSizeF, QRectF, QPointF, QSize, QRect,
-                          pyqtSignal, QMarginsF, QByteArray, QPropertyAnimation, QEasingCurve)
+                          pyqtSignal, QMarginsF, QByteArray, QPropertyAnimation, QEasingCurve,
+                          QObject, QEvent)
 from PyQt6.QtGui import (
     QFont, QIcon, QColor, QFontDatabase, QTextDocument, QPixmap, QPainter, QImage,
     QLinearGradient, QBrush, QPageSize, QPageLayout, QAction, QTextOption,
@@ -50,7 +51,7 @@ from matplotlib.figure import Figure
 # تنظیم ID جهت آیکون ویندوز
 try:
     import ctypes
-    myappid = 'imartstudio.accounting.v13.0'
+    myappid = 'imartstudio.accounting.v14.0'
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 except Exception:
     pass
@@ -73,10 +74,32 @@ def get_app_dir():
 
 APP_DIR = get_app_dir()
 DB_NAME = os.path.join(APP_DIR, "studio_accounting.db")
-APP_VERSION = "13.0"
+APP_VERSION = "14.0"
 
 # چهار پکیج ثابت و بدون تغییر برنامه (طبق درخواست نسخه ۱۳)
 FIXED_PACKAGES = ["پک ایمارت", "پک ویژه", "پک استاندارد", "پک عقدی"]
+# کدهای اختصاصی پکیج‌های ثابت تا هرگز با کد کالاها/پکیج‌های ساخته‌شده تضاد نکنند
+FIXED_PACKAGE_CODES = ["FIX-2001", "FIX-2002", "FIX-2003", "FIX-2004"]
+
+
+def ensure_fixed_packages(cursor):
+    """
+    چهار پکیج اصلی برنامه همیشه وجود دارند و حذف نمی‌شوند.
+    اگر کاربر آن‌ها را از انبار پاک کند، در همان اجرا دوباره ساخته می‌شوند.
+    """
+    for i, pkg in enumerate(FIXED_PACKAGES):
+        try:
+            cursor.execute("""INSERT INTO item_prices
+                                  (item_name, code, price, is_package, parent_package, is_fixed)
+                              VALUES (?, ?, 0, 1, '', 1)
+                              ON CONFLICT(item_name) DO UPDATE SET
+                                  is_package=1, is_fixed=1,
+                                  code=excluded.code""",
+                           (pkg, FIXED_PACKAGE_CODES[i]))
+            cursor.execute("INSERT OR IGNORE INTO inventory (item_name, total_count, used_count) "
+                           "VALUES (?, 0, 0)", (pkg,))
+        except Exception as e:
+            print(f"[DB] ensure fixed package '{pkg}' failed: {e}")
 
 
 def is_fixed_package(name):
@@ -1451,7 +1474,13 @@ def restore_geometry(key, widget):
 
 
 def persist_dialog(dialog, key):
-    """ابعاد دیالوگ را ذخیره و در اجرای بعدی همان‌طور بازیابی می‌کند"""
+    """
+    ابعاد دیالوگ را ذخیره و در اجرای بعدی همان‌طور بازیابی می‌کند.
+    کلید روی خود دیالوگ هم ثبت می‌شود تا نگهبان خودکار ابعاد از همان کلید
+    استفاده کند و تنظیمات تکراری ساخته نشود.
+    """
+    dialog._persist_key = key
+    dialog._persist_restored = True
     restore_geometry(key, dialog)
     try:
         dialog.finished.connect(lambda _r: save_geometry(key, dialog))
@@ -1605,6 +1634,40 @@ def filter_table_rows(table, text):
     return visible
 
 
+class _DialogGeometryKeeper(QObject):
+    """
+    ابعاد و مکان هر دیالوگ را با هر تغییر اندازه ذخیره می‌کند
+    (با کمی تأخیر) و در اجرای بعدی همان‌طور برمی‌گرداند.
+    """
+
+    def __init__(self, dialog, key, delay_ms=450):
+        super().__init__(dialog)
+        self.dialog = dialog
+        self.key = key
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.setInterval(delay_ms)
+        self.timer.timeout.connect(self.save)
+        dialog.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        try:
+            t = event.type()
+            if t == QEvent.Type.Resize or t == QEvent.Type.Move:
+                self.timer.start()
+            elif t in (QEvent.Type.Close, QEvent.Type.Hide):
+                self.save()
+        except Exception:
+            pass
+        return False
+
+    def save(self):
+        try:
+            save_geometry(self.key, self.dialog)
+        except Exception as e:
+            print("[GEOM] auto save failed:", e)
+
+
 def _prepare_dialog_for_resize(dialog):
     """
     پیش از نمایش هر دیالوگ، آن را «از همه طرف — از جمله لبه بالا — قابل تغییر اندازه»
@@ -1616,6 +1679,16 @@ def _prepare_dialog_for_resize(dialog):
         return
     dialog._resize_ready = True
     try:
+        # ذخیره خودکار ابعاد و بازیابی در اجرای بعدی
+        if not getattr(dialog, "_auto_persist", False):
+            dialog._auto_persist = True
+            cls_name = dialog.__class__.__name__
+            key = getattr(dialog, "_persist_key", "") or f"auto_{cls_name}"
+            dialog._persist_key = key
+            if not getattr(dialog, "_persist_restored", False):
+                restore_geometry(key, dialog)
+                dialog._persist_restored = True
+            dialog._geom_keeper = _DialogGeometryKeeper(dialog, key)
         dialog.setSizeGripEnabled(True)
         dialog.setMaximumSize(16777215, 16777215)
         lay = dialog.layout()
@@ -1623,8 +1696,8 @@ def _prepare_dialog_for_resize(dialog):
             lay.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         mw = dialog.minimumWidth()
         mh = dialog.minimumHeight()
-        dialog.setMinimumSize(min(mw if mw > 0 else 400, 440),
-                              min(mh if mh > 0 else 300, 300))
+        dialog.setMinimumSize(min(mw if mw > 0 else 380, 400),
+                              min(mh if mh > 0 else 280, 280))
     except Exception as e:
         print("[DIALOG] prepare resize failed:", e)
 
@@ -2477,6 +2550,31 @@ def init_db():
             pass
         _set_flag(cursor, "migration_v13_packages")
         print("[DB] Migration: v13 fixed packages ready")
+
+    # ۲-۴) ریست انبار در نسخه ۱۴: شروع از صفر برای دوربین‌ها و خدمات
+    if not _flag_is_set(cursor, "migration_v14_reset"):
+        try:
+            cursor.execute("DELETE FROM package_items")
+            # همه کالاها و خدمات (پکیج نباشند) پاک می‌شوند
+            cursor.execute("DELETE FROM item_prices WHERE COALESCE(is_package,0)=0")
+            # پکیج‌های ساخته‌شده در نسخه‌های قبل هم پاک می‌شوند؛
+            # فقط چهار پکیج اصلی برنامه باقی می‌مانند
+            cursor.execute("DELETE FROM item_prices WHERE is_package=1 AND item_name NOT IN "
+                           "(?, ?, ?, ?)", tuple(FIXED_PACKAGES))
+            cursor.execute("DELETE FROM inventory WHERE item_name NOT IN "
+                           "(SELECT item_name FROM item_prices)")
+            cursor.execute("UPDATE item_prices SET price=0 WHERE is_package=1")
+            cursor.execute("UPDATE inventory SET total_count=0, used_count=0")
+            # جلوگیری از برگشتن اقلام پیش‌فرض نسخه‌های قبل
+            cursor.execute("INSERT OR REPLACE INTO settings (key, value) "
+                           "VALUES ('seeded_defaults_v11', '1')")
+            _set_flag(cursor, "migration_v14_reset")
+            print("[DB] Migration: v14 inventory reset (شروع از صفر)")
+        except Exception as e:
+            print("[DB] v14 reset failed:", e)
+
+    # چهار پکیج اصلی در هر اجرا تضمین می‌شوند
+    ensure_fixed_packages(cursor)
 
     # ۳) ردیف بیعانه‌ها و پرداخت‌ها همیشه درست شماره‌گذاری شود (فقط نمایشی است)
 
@@ -3639,7 +3737,9 @@ class ManageItemsDialog(QDialog):
         self.load_tree_items()
 
     def update_profit_hint(self, *args):
-        price = parse_number(self.txt_price.text())
+        if not hasattr(self, "lbl_profit") or not hasattr(self, "txt_item_price"):
+            return
+        price = parse_number(self.txt_item_price.text())
         self.lbl_profit.setText(
             f"{ico('money')} <b>سود این قلم (نصف قیمت):</b> {price // 2:,} تومان "
             f"از قیمت {price:,} تومان — محاسبه سود خودکار است.")
@@ -3836,6 +3936,12 @@ class ManageItemsDialog(QDialog):
         name = self._selected_item_name()
         if not name:
             QMessageBox.warning(self, "خطا", "لطفاً یک آیتم را انتخاب کنید.")
+            return
+        if is_fixed_package(name):
+            QMessageBox.warning(
+                self, "پکیج ثابت",
+                f"«{name}» یکی از چهار پکیج اصلی برنامه است و حذف نمی‌شود.\n"
+                "این پکیج‌ها بخشی ثابت از برنامه هستند.")
             return
 
         conn = sqlite3.connect(DB_NAME)
@@ -5434,7 +5540,8 @@ class InvoiceBuilder:
     # =====================  رسید وجه  ==========================
     # ============================================================
     @staticmethod
-    def build_receipt(name, amount, for_service, date_str, direction="دریافتی", mono=False):
+    def build_receipt(name, amount, for_service, date_str, direction="دریافتی", mono=False,
+                     contract_info=None):
         p = doc_palette(mono)
         studio_name, studio_phone, studio_address = InvoiceBuilder._studio_info()
         now = jdatetime.datetime.now()
@@ -5478,6 +5585,53 @@ class InvoiceBuilder:
             ])
         )
 
+        # ---------- وضعیت حساب قرارداد (بیعانه‌های پرداخت‌شده و مانده) ----------
+        contract_block = ""
+        if contract_info:
+            try:
+                ci = contract_info
+                c_total = int(ci.get("total") or 0)
+                c_paid = int(ci.get("paid") or 0)
+                c_remain = max(0, c_total - c_paid)
+                dep_rows = ""
+                for i, dep in enumerate(ci.get("deposits") or [], start=1):
+                    dep_rows += InvoiceBuilder._row([
+                        InvoiceBuilder._td(str(i), size="8pt"),
+                        InvoiceBuilder._td(f"{int(dep.get('amount') or 0):,}", size="8pt"),
+                        InvoiceBuilder._td(dep.get("date") or "-", size="8pt"),
+                        InvoiceBuilder._td(dep.get("bank") or "-", size="8pt"),
+                    ])
+                if not dep_rows:
+                    dep_rows = ("<tr>" + InvoiceBuilder._td(
+                        'بیعانه‌ای برای این قرارداد ثبت نشده است',
+                        colspan=4, size='8pt') + "</tr>")
+                contract_block = (
+                    f"<div style='margin-top:7px; font-size:9pt; font-weight:bold; "
+                    f"color:{p['accent']};'>وضعیت حساب قرارداد "
+                    f"{ci.get('code', '-')} — {ci.get('customer', '-')}</div>"
+                    f"<table width='100%' style='border-collapse:collapse; margin-top:3px;'>"
+                    + InvoiceBuilder._row([
+                        InvoiceBuilder._td("<b>جمع کل قرارداد</b>", align="right",
+                                           bg=p["box_bg"], size="8.5pt", bold=True, width="55%"),
+                        InvoiceBuilder._td(f"{c_total:,}", size="8.5pt")])
+                    + InvoiceBuilder._row([
+                        InvoiceBuilder._td("<b>جمع بیعانه‌های پرداخت‌شده</b>", align="right",
+                                           bg=p["box_bg"], size="8.5pt", bold=True),
+                        InvoiceBuilder._td(f"{c_paid:,}", size="8.5pt")])
+                    + InvoiceBuilder._row([
+                        InvoiceBuilder._td("<b>مانده قابل پرداخت</b>", align="right",
+                                           bg=p["total_bg"], size="9pt", bold=True),
+                        InvoiceBuilder._td(f"<b>{c_remain:,}</b>", size="9pt", bold=True)])
+                    + "</table>"
+                    + (f"<div style='margin-top:5px; font-size:8.5pt; font-weight:bold; "
+                       f"color:{p['accent']};'>ریز بیعانه‌های پرداخت‌شده</div>"
+                       f"<table width='100%' style='border-collapse:collapse;'>"
+                       f"<thead>{InvoiceBuilder._head(['ردیف', 'مبلغ (تومان)', 'تاریخ', 'بانک'], bg=p['table_head'], fg=p['table_head_fg'])}</thead>"
+                       f"<tbody>{dep_rows}</tbody></table>")
+                )
+            except Exception as e:
+                print("[RECEIPT] contract block error:", e)
+
         html = f"""
         <div dir="rtl" style="font-family:'{INVOICE_FONT_FAMILY}', Tahoma; font-size:9pt;">
           {InvoiceBuilder._title_band(
@@ -5486,6 +5640,7 @@ class InvoiceBuilder:
               [f"تاریخ: {date_str}", f"ساعت: {now.strftime('%H:%M')}",
                f"شماره رسید: RC-{now.strftime('%y%m%d%H%M')}"])}
           <table width="100%" style="border-collapse:collapse; margin-top:6px;">{rows}</table>
+          {contract_block}
           <div style="margin-top:8px; border:1px solid {p['warn_border']}; background-color:{p['warn_bg']};
                       padding:5px; font-size:8.5pt;">
             <b>توجه:</b> بیعانه پرداختی پس داده نمی‌شود.
@@ -5717,7 +5872,7 @@ class StudioAccountingApp(QMainWindow):
         except Exception as e:
             print("Error in check alerts:", e)
 
-    def make_dashboard_button(self, icon, title, color, index):
+    def make_dashboard_button(self, icon, title, color, tab_attr):
         """
         کارت گرافیکی منو با انیمیشن:
         با ورود موس، دکمه کمی بزرگ‌تر می‌شود و حلقه رنگی دور آیکون روشن می‌گردد.
@@ -5807,7 +5962,7 @@ class StudioAccountingApp(QMainWindow):
 
         btn.on_enter = on_enter
         btn.on_leave = on_leave
-        btn.clicked.connect(lambda _, i=index: self.open_tab_index(i))
+        btn.clicked.connect(lambda _, a=tab_attr: self.open_named_tab(a))
         btn.setToolTip(f"ورود به بخش {title}")
         btn._anim = anim
         return holder
@@ -5923,27 +6078,30 @@ class StudioAccountingApp(QMainWindow):
         root.addSpacing(4)
 
         # ---------------- ۱۲ آیتم در دو ردیف ۶ تایی وسط‌چین ----------------
+        # هر دکمه به «نام تب» وصل است، نه شماره آن؛ بنابراین با اضافه یا
+        # جابه‌جا شدن تب‌ها هیچ‌وقت مسیر اشتباه نمی‌رود.
         buttons = [
-            (ico('wedding'),    "پروژه‌های عروس و داماد\n(قراردادها)", 0,  "#8e44ad"),
-            (ico('commercial'), "تبلیغاتی / بیوتی / تولدی\n(پروژه‌ها)", 1,  "#16a085"),
-            (ico('staff'),      "کارکنان و حقوق\n(پرسنل)", 2,             "#2980b9"),
-            (ico('expenses'),   "مدیریت هزینه‌ها\n(قبوض و...)", 3,         "#c0392b"),
-            (ico('reports'),    "گزارش مالی جامع\n(نمودارها)", 4,         "#d35400"),
-            (ico('search'),     "جستجوی پیشرفته\n(کلی)", 5,               "#00838f"),
-            (ico('inventory'),  "انبار تجهیزات\n(موجودی)", 6,             "#2c3e50"),
-            (ico('banks'),      "کارت‌های بانکی\n(بانک‌ها)", 7,            "#0e6655"),
-            (ico('checks'),     "مدیریت چک‌ها\n(دریافتی/پرداختی)", 8,     "#e67e22"),
-            (ico('receipt'),    "صدور رسید وجه\n(خدمات)", 9,              "#7f8c8d"),
-            (ico('settings'),   "تنظیمات و سال کاری\n(سیستم)", 10,        "#5d6d7e"),
-            (ico('about'),      "درباره برنامه\n(توسعه‌دهنده)", 11,       "#34495e"),
+            (ico('wedding'),    "پروژه‌های عروس و داماد\n(قراردادها)", "tab_wedding",    "#8e44ad"),
+            (ico('commercial'), "تبلیغاتی / بیوتی / تولدی\n(پروژه‌ها)", "tab_commercial", "#16a085"),
+            (ico('staff'),      "کارکنان و حقوق\n(پرسنل)", "tab_staff",                "#2980b9"),
+            (ico('expenses'),   "مدیریت هزینه‌ها\n(قبوض و...)", "tab_expenses",         "#c0392b"),
+            (ico('reports'),    "گزارش مالی جامع\n(نمودارها)", "tab_reports",          "#d35400"),
+            (ico('search'),     "جستجوی پیشرفته\n(کلی)", "tab_search",                 "#00838f"),
+            (ico('inventory'),  "انبار تجهیزات و خدمات\n(موجودی)", "tab_inventory",    "#2c3e50"),
+            (ico('money'),      "مدیریت هزینه‌های استودیو\n(دریافتی/پرداختی)", "tab_costs", "#b9770e"),
+            (ico('receipt'),    "صدور رسید وجه\n(خدمات)", "tab_receipt",               "#7f8c8d"),
+            (ico('banks'),      "کارت‌های بانکی\n(بانک‌ها)", "tab_banks",              "#0e6655"),
+            (ico('checks'),     "مدیریت چک‌ها\n(دریافتی/پرداختی)", "tab_checks",       "#e67e22"),
+            (ico('settings'),   "تنظیمات و سال کاری\n(سیستم)", "tab_workyear",         "#5d6d7e"),
+            (ico('about'),      "درباره برنامه\n(توسعه‌دهنده)", "tab_about",           "#34495e"),
         ]
 
         grid = QGridLayout()
         grid.setSpacing(10)
         grid.setContentsMargins(0, 0, 0, 0)
-        for i, (icon, text, index, color) in enumerate(buttons):
+        for i, (icon, text, tab_attr, color) in enumerate(buttons):
             r, c = divmod(i, 6)
-            grid.addWidget(self.make_dashboard_button(icon, text, color, index), r, c)
+            grid.addWidget(self.make_dashboard_button(icon, text, color, tab_attr), r, c)
 
         grid_wrap = QHBoxLayout()
         grid_wrap.addStretch(1)
@@ -6060,6 +6218,7 @@ class StudioAccountingApp(QMainWindow):
                 self.load_person_events()
                 self.load_inventory()
                 self.load_checks_table()
+                self.load_receipt_contracts()
                 self.load_report_persons_combo()
                 self.calculate_financial_report()
                 self.refresh_settlement_cards()
@@ -6076,6 +6235,27 @@ class StudioAccountingApp(QMainWindow):
 
         if hasattr(self, 'tabs'):
             QMessageBox.information(self, "تغییر سال", f"سال کاری به {year} تغییر یافت.")
+
+    def open_named_tab(self, tab_attr):
+        """
+        رفتن به تب بر اساس «نام متغیر تب».
+        این روش به‌جای شماره‌گذاری دستی است، پس با اضافه یا جابه‌جا شدن تب‌ها
+        هیچ‌وقت به صفحه اشتباه نمی‌رود.
+        """
+        try:
+            tab = getattr(self, tab_attr, None)
+            if tab is None:
+                print(f"[NAV] tab '{tab_attr}' not found")
+                QMessageBox.warning(self, "خطا", "این بخش در برنامه پیدا نشد.")
+                return
+            idx = self.tabs.indexOf(tab)
+            if idx < 0:
+                print(f"[NAV] tab '{tab_attr}' not in QTabWidget")
+                QMessageBox.warning(self, "خطا", "این بخش در فهرست تب‌ها نیست.")
+                return
+            self.open_tab_index(idx)
+        except Exception as e:
+            print("[NAV] open_named_tab error:", e)
 
     def open_costs_tab(self):
         """رفتن به تب مدیریت هزینه‌های استودیو"""
@@ -6634,8 +6814,12 @@ class StudioAccountingApp(QMainWindow):
         splitter.setSizes([560, 840])
         persist_splitter(splitter, "tab_wedding")
 
-        outer = QHBoxLayout()
-        outer.addWidget(splitter)
+        # چیدمان عمودی بیرونی: نوار جستجو همیشه بالای صفحه (نه در ستون چپ)
+        wrap = QHBoxLayout()
+        wrap.addWidget(splitter)
+        outer = QVBoxLayout()
+        outer.setSpacing(7)
+        outer.addLayout(wrap, 1)
         self.tab_wedding.setLayout(outer)
         self.load_wedding_contracts()
 
@@ -7313,6 +7497,9 @@ class StudioAccountingApp(QMainWindow):
     # ==============  تب ۲: تبلیغاتی / بیوتی  ===================
     # ============================================================
     def setup_commercial_tab(self):
+        # چیدمان عمودی بیرونی: نوار جستجو همیشه بالای صفحه (نه در ستون چپ)
+        outer = QVBoxLayout()
+        outer.setSpacing(7)
         layout = QHBoxLayout()
         layout.setSpacing(10)
 
@@ -7394,7 +7581,8 @@ class StudioAccountingApp(QMainWindow):
         table_box.setLayout(t_layout)
         layout.addWidget(table_box, 5)
 
-        self.tab_commercial.setLayout(layout)
+        outer.addLayout(layout, 1)
+        self.tab_commercial.setLayout(outer)
         self.load_commercial_projects()
 
     def update_commercial_words(self):
@@ -8038,6 +8226,9 @@ class StudioAccountingApp(QMainWindow):
     # ==============  تب ۴: مدیریت هزینه‌ها  ====================
     # ============================================================
     def setup_expenses_tab(self):
+        # چیدمان عمودی بیرونی: نوار جستجو همیشه بالای صفحه (نه در ستون چپ)
+        outer = QVBoxLayout()
+        outer.setSpacing(7)
         layout = QHBoxLayout()
         layout.setSpacing(8)
 
@@ -8146,7 +8337,8 @@ class StudioAccountingApp(QMainWindow):
         table_box.setLayout(t_layout)
         layout.addWidget(table_box, 6)
 
-        self.tab_expenses.setLayout(layout)
+        outer.addLayout(layout, 1)
+        self.tab_expenses.setLayout(outer)
         self.load_expenses_table()
         self.refresh_settlement_cards()
 
@@ -9750,6 +9942,12 @@ class StudioAccountingApp(QMainWindow):
                                 "موجودی و فاکتورها هماهنگ شدند.")
 
     def delete_inventory_item(self, item_name):
+        if is_fixed_package(item_name):
+            QMessageBox.warning(
+                self, "پکیج ثابت",
+                f"«{item_name}» یکی از چهار پکیج اصلی برنامه است و حذف نمی‌شود.\n"
+                "این پکیج‌ها بخشی ثابت از برنامه هستند.")
+            return
         if QMessageBox.question(
                 self, "تایید حذف",
                 f"آیا «{item_name}» از انبار و لیست فاکتورها حذف شود؟",
@@ -9852,6 +10050,9 @@ class StudioAccountingApp(QMainWindow):
     # ==============  تب ۸: کارت‌های بانکی  ====================
     # ============================================================
     def setup_banks_tab(self):
+        # چیدمان عمودی بیرونی: نوار جستجو همیشه بالای صفحه (نه در ستون چپ)
+        outer = QVBoxLayout()
+        outer.setSpacing(7)
         layout = QHBoxLayout()
         layout.setSpacing(10)
 
@@ -9900,7 +10101,8 @@ class StudioAccountingApp(QMainWindow):
         table_box.setLayout(tl)
         layout.addWidget(table_box, 4)
 
-        self.tab_banks.setLayout(layout)
+        outer.addLayout(layout, 1)
+        self.tab_banks.setLayout(outer)
         self.load_bank_cards()
 
     def save_bank_card(self):
@@ -9956,6 +10158,9 @@ class StudioAccountingApp(QMainWindow):
     # ==============  تب ۹: مدیریت چک‌ها  =====================
     # ============================================================
     def setup_checks_tab(self):
+        # چیدمان عمودی بیرونی: نوار جستجو همیشه بالای صفحه (نه در ستون چپ)
+        outer = QVBoxLayout()
+        outer.setSpacing(7)
         layout = QHBoxLayout()
         layout.setSpacing(10)
 
@@ -10045,7 +10250,8 @@ class StudioAccountingApp(QMainWindow):
         table_box.setLayout(tl)
         layout.addWidget(table_box, 5)
 
-        self.tab_checks.setLayout(layout)
+        outer.addLayout(layout, 1)
+        self.tab_checks.setLayout(outer)
         self.update_check_labels()
         self.load_checks_table()
 
@@ -10690,6 +10896,13 @@ class StudioAccountingApp(QMainWindow):
         self.rc_customer_combo.currentIndexChanged.connect(self.on_receipt_customer_selected)
         form_layout.addRow(f"{ico('people')} انتخاب سریع از مشتریان:", self.rc_customer_combo)
 
+        # انتخاب قرارداد: بیعانه‌های پرداخت‌شده و مانده روی رسید چاپ می‌شود
+        self.rc_contract_combo = QComboBox()
+        self.load_receipt_contracts()
+        self.rc_contract_combo.currentIndexChanged.connect(self.on_receipt_contract_selected)
+        form_layout.addRow(f"{ico('wedding')} قرارداد مرتبط (بیعانه‌ها و مانده):",
+                           self.rc_contract_combo)
+
         self.rc_name = QLineEdit()
         self.rc_amount = QLineEdit()
         self.rc_amount.textChanged.connect(lambda t: self.rc_amount.setText(format_number(t)))
@@ -10772,6 +10985,74 @@ class StudioAccountingApp(QMainWindow):
         except Exception as e:
             print("[RECEIPT] load customers error:", e)
 
+    def load_receipt_contracts(self):
+        """پر کردن فهرست قراردادها برای نمایش بیعانه و مانده روی رسید"""
+        if not hasattr(self, "rc_contract_combo"):
+            return
+        self.rc_contract_combo.blockSignals(True)
+        self.rc_contract_combo.clear()
+        self.rc_contract_combo.addItem("--- بدون قرارداد ---", None)
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("""SELECT id, code, groom_name, bride_name,
+                                     COALESCE(total_amount,0), COALESCE(discount,0),
+                                     COALESCE(paid_amount,0)
+                              FROM wedding_contracts ORDER BY id DESC LIMIT 400""")
+            for cid, code, groom, bride, total, disc, paid in cursor.fetchall():
+                net = max(0, int(total or 0) - int(disc or 0))
+                remain = max(0, net - int(paid or 0))
+                label = f"{code or '-'} | {groom} و {bride} | مانده: {remain:,}"
+                self.rc_contract_combo.addItem(label, cid)
+            conn.close()
+        except Exception as e:
+            print("[RECEIPT] load contracts error:", e)
+        self.rc_contract_combo.blockSignals(False)
+
+    def _receipt_contract_info(self):
+        """اطلاعات قرارداد انتخاب‌شده همراه ریز بیعانه‌ها"""
+        cid = self.rc_contract_combo.currentData() if hasattr(self, "rc_contract_combo") else None
+        if not cid:
+            return None
+        try:
+            conn = sqlite3.connect(DB_NAME)
+            cursor = conn.cursor()
+            cursor.execute("""SELECT code, groom_name, bride_name,
+                                     COALESCE(total_amount,0), COALESCE(discount,0),
+                                     COALESCE(paid_amount,0)
+                              FROM wedding_contracts WHERE id=?""", (cid,))
+            row = cursor.fetchone()
+            if not row:
+                conn.close()
+                return None
+            code, groom, bride, total, disc, paid = row
+            cursor.execute("""SELECT COALESCE(amount,0), COALESCE(deposit_date,''),
+                                     COALESCE(bank_name,'')
+                              FROM wedding_deposits WHERE contract_id=?
+                              ORDER BY deposit_date""", (cid,))
+            deposits = [{"amount": a, "date": d, "bank": b} for a, d, b in cursor.fetchall()]
+            conn.close()
+            return {
+                "id": cid, "code": code or "-", "customer": f"{groom} و {bride}",
+                "total": max(0, int(total or 0) - int(disc or 0)),
+                "paid": int(paid or 0),
+                "deposits": deposits,
+            }
+        except Exception as e:
+            print("[RECEIPT] contract info error:", e)
+            return None
+
+    def on_receipt_contract_selected(self, _idx=None):
+        """با انتخاب قرارداد، نام و بابت خودکار پر می‌شود"""
+        info = self._receipt_contract_info()
+        if info:
+            if not self.rc_name.text().strip() or self.rc_name.text().strip() == "-":
+                self.rc_name.setText(info["customer"])
+            remain = max(0, info["total"] - info["paid"])
+            if remain > 0 and not parse_number(self.rc_amount.text()):
+                self.rc_amount.setText(f"{remain:,}")
+        self.update_receipt_preview()
+
     def on_receipt_customer_selected(self, _idx=None):
         data = self.rc_customer_combo.currentData() if hasattr(self, "rc_customer_combo") else None
         if data:
@@ -10798,7 +11079,8 @@ class StudioAccountingApp(QMainWindow):
 
         direction = "دریافتی" if self.rc_direction.currentIndex() == 0 else "پرداختی"
         html = InvoiceBuilder.build_receipt(
-            name or "-", amount, self.rc_for.text(), self.rc_date.text(), direction)
+            name or "-", amount, self.rc_for.text(), self.rc_date.text(), direction,
+            mono=False, contract_info=self._receipt_contract_info())
         self.rc_preview.setHtml(html)
 
     def get_receipt_html(self, mono=False):
@@ -10808,7 +11090,8 @@ class StudioAccountingApp(QMainWindow):
             return None
         direction = "دریافتی" if self.rc_direction.currentIndex() == 0 else "پرداختی"
         return InvoiceBuilder.build_receipt(
-            name, amount, self.rc_for.text(), self.rc_date.text(), direction, mono)
+            name, amount, self.rc_for.text(), self.rc_date.text(), direction, mono,
+            contract_info=self._receipt_contract_info())
 
     def print_receipt(self):
         html = self.get_receipt_html(mono=True)
